@@ -85,7 +85,11 @@ def human_readable(n: float, unit: str, *, precision: int = 2) -> str:
     return f"{value:.{precision}f} {prefix}{unit}"
 
 
-def tgobject_list_writer(fp, indent: int | str | None = 2, executor: Executor | None = None) -> ContextManager[JSONListWriter]:
+def tgobject_list_writer(
+    fp,
+    indent: int | str | None = 2,
+    executor: Executor | None = None
+) -> ContextManager[JSONListWriter]:
     return list_writer(fp=fp, indent=indent, default=Object.default, ensure_ascii=False, executor=executor)
 
 
