@@ -38,6 +38,9 @@ Return = TypeVar("Return")
 TGMedia: TypeAlias = Audio | Document | Photo | Sticker | Animation | Video | Voice | VideoNote
 TGMediaTypes = Audio, Document, Photo, Sticker, Animation, Video, Voice, VideoNote
 
+DEFAULT_ENCODING = "utf-8"
+DEFAULT_JSON_INDENT = 2
+TELEGRAM_BACKOFF_TIME = 30
 
 IMAGE_EXTS = {type: ".jpg" for type in PHOTO_TYPES}
 ANIMATED_EXTS = {
@@ -84,10 +87,6 @@ def human_readable(n: float, unit: str, *, precision: int = 2) -> str:
     divisor, prefix = SIZES[idx]
     value = round(n/divisor, precision)
     return f"{value:.{precision}f} {prefix}{unit}"
-
-
-DEFAULT_ENCODING = "utf-8"
-DEFAULT_JSON_INDENT = 2
 
 
 def tgobject_list_writer(
@@ -358,7 +357,7 @@ async def get_chat_avatars(client: Client, chat_id: int) -> list[Photo] | None:
         except FloodWait as flood:
             log.warning("Got floodwait from Telegram", exc_info=flood)
             retry = True
-            await asyncio.sleep(30)
+            await asyncio.sleep(TELEGRAM_BACKOFF_TIME)
     return avatars
 
 
