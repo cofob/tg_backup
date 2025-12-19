@@ -58,7 +58,7 @@ DEFAULT_EXTS = defaultdict(lambda: ".unknown", {
 RETORT = Retort()
 
 
-log = logging.getLogger('tg_backup')
+log = logging.getLogger(__name__)
 
 
 SIZES = sorted([
