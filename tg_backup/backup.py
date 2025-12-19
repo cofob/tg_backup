@@ -87,11 +87,12 @@ def human_readable(n: float, unit: str, *, precision: int = 2) -> str:
 
 
 DEFAULT_ENCODING = "utf-8"
+DEFAULT_JSON_INDENT = 2
 
 
 def tgobject_list_writer(
     fp,
-    indent: int | str | None = 2,
+    indent: int | str | None = DEFAULT_JSON_INDENT,
     executor: Executor | None = None
 ) -> AbstractContextManager[JSONListWriter]:
     return list_writer(fp=fp, indent=indent, default=Object.default, ensure_ascii=False, executor=executor)
@@ -140,7 +141,7 @@ async def backup(client: Client, output_dir: Path) -> None:
         chats = await get_chats_info(client=client)
         log.info("Dump chats info (%s).", chats_json)
         with open(chats_json, "w", encoding=DEFAULT_ENCODING) as f:
-            json.dump(chats, f, indent=2, default=Object.default, ensure_ascii=False)
+            json.dump(chats, f, indent=DEFAULT_JSON_INDENT, default=Object.default, ensure_ascii=False)
 
     chats_dir = output_dir / "chats"
     chats_dir.mkdir(parents=True, exist_ok=True)
@@ -171,14 +172,14 @@ async def backup_chat(client: Client, chat: Chat, output_dir: Path):
     chat_info_json = output_dir / "info.json"
     log.info("Dump chat info (%s).", chat_info_json)
     with open(chat_info_json, "w", encoding=DEFAULT_ENCODING) as f:
-        json.dump(chat_info, f, indent=2, default=Object.default, ensure_ascii=False)
+        json.dump(chat_info, f, indent=DEFAULT_JSON_INDENT, default=Object.default, ensure_ascii=False)
 
     log.info("Get chat avatars info.")
     avatars = await get_chat_avatars(client, chat.id)
     avatars_json = output_dir / "avatars.json"
     log.info("Dump chat avatars info (%s).", avatars_json)
     with avatars_json.open("w", encoding=DEFAULT_ENCODING) as f:
-        json.dump(avatars, f, indent=2, default=Object.default, ensure_ascii=False)
+        json.dump(avatars, f, indent=DEFAULT_JSON_INDENT, default=Object.default, ensure_ascii=False)
 
     messages_json = output_dir / "messages.json"
     medias_json = output_dir / "medias.json"
