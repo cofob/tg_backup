@@ -86,6 +86,9 @@ def human_readable(n: float, unit: str, *, precision: int = 2) -> str:
     return f"{value:.{precision}f} {prefix}{unit}"
 
 
+DEFAULT_ENCODING = "utf-8"
+
+
 def tgobject_list_writer(
     fp,
     indent: int | str | None = 2,
@@ -121,7 +124,7 @@ async def backup(client: Client, output_dir: Path) -> None:
     chats: Sequence[Chat]
     if chats_json.exists():
         log.info("Read chats info (%s)", chats_json)
-        with chats_json.open("r", encoding="utf-8") as f:
+        with chats_json.open("r", encoding=DEFAULT_ENCODING) as f:
             chats_raw = json.load(f)
             ids = [info["id"] for info in chats_raw]
             chats_by_id = {chat.id: chat for chat in await get_chats_info(client=client)}
@@ -136,7 +139,7 @@ async def backup(client: Client, output_dir: Path) -> None:
     else:
         chats = await get_chats_info(client=client)
         log.info("Dump chats info (%s).", chats_json)
-        with open(chats_json, "w", encoding="utf-8") as f:
+        with open(chats_json, "w", encoding=DEFAULT_ENCODING) as f:
             json.dump(chats, f, indent=2, default=Object.default, ensure_ascii=False)
 
     chats_dir = output_dir / "chats"
@@ -167,22 +170,22 @@ async def backup_chat(client: Client, chat: Chat, output_dir: Path):
     chat_info = await client.get_chat(chat_id=chat.id)
     chat_info_json = output_dir / "info.json"
     log.info("Dump chat info (%s).", chat_info_json)
-    with open(chat_info_json, "w", encoding="utf-8") as f:
+    with open(chat_info_json, "w", encoding=DEFAULT_ENCODING) as f:
         json.dump(chat_info, f, indent=2, default=Object.default, ensure_ascii=False)
 
     log.info("Get chat avatars info.")
     avatars = await get_chat_avatars(client, chat.id)
     avatars_json = output_dir / "avatars.json"
     log.info("Dump chat avatars info (%s).", avatars_json)
-    with avatars_json.open("w", encoding="utf-8") as f:
+    with avatars_json.open("w", encoding=DEFAULT_ENCODING) as f:
         json.dump(avatars, f, indent=2, default=Object.default, ensure_ascii=False)
 
     messages_json = output_dir / "messages.json"
     medias_json = output_dir / "medias.json"
     log.info("Dump chat messages (%s).", messages_json)
     with (
-        messages_json.open("w", encoding="utf-8") as messages_file,
-        medias_json.open("w", encoding="utf-8") as medias_file,
+        messages_json.open("w", encoding=DEFAULT_ENCODING) as messages_file,
+        medias_json.open("w", encoding=DEFAULT_ENCODING) as medias_file,
         ThreadPoolExecutor() as executor,
         tgobject_list_writer(messages_file, executor=executor) as messages_writer,
         tgobject_list_writer(medias_file, executor=executor) as medias_writer
@@ -224,7 +227,7 @@ async def load_files(client: Client, infos_json: Path, output_dir: Path) -> None
     queue: asyncio.Queue[MediaFileInfo] = asyncio.Queue()
 
     try:
-        with infos_json.open("r", encoding="utf-8") as f:
+        with infos_json.open("r", encoding=DEFAULT_ENCODING) as f:
             for index, info_view in enumerate(load(f)):
                 info_raw = to_standard_types(info_view)
                 info = RETORT.load(info_raw, MediaFileInfo)
