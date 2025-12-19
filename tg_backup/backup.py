@@ -282,6 +282,7 @@ def get_media_file_info(client: Client, media: TGMedia) -> MediaFileInfo | None:
 
     file_info = FileId.decode(file_id)
     if file_info is None:
+        log.warning("Can't decode file id %s (%s) ", file_id, type(media).__name__)
         return None
 
     file_type = file_info.file_type
