@@ -7,12 +7,13 @@ import logging
 from collections import defaultdict
 from collections.abc import AsyncIterator, Callable, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime as dt
 from functools import cached_property
 from operator import attrgetter
 from pathlib import Path
-from typing import ContextManager, NamedTuple, ParamSpec, Protocol, TypeAlias, TypeVar, TypeVarTuple
+from typing import NamedTuple, ParamSpec, Protocol, TypeAlias, TypeVar, TypeVarTuple
 
 from adaptix import Retort
 from json_stream import load, to_standard_types
@@ -89,7 +90,7 @@ def tgobject_list_writer(
     fp,
     indent: int | str | None = 2,
     executor: Executor | None = None
-) -> ContextManager[JSONListWriter]:
+) -> AbstractContextManager[JSONListWriter]:
     return list_writer(fp=fp, indent=indent, default=Object.default, ensure_ascii=False, executor=executor)
 
 
