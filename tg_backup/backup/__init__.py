@@ -476,6 +476,8 @@ async def refresh_forum_topics(
         return
     if chat.type is not ChatType.SUPERGROUP:
         return
+    if not await is_forum_chat(client, chat.id):
+        return
 
     try:
         topics = await get_forum_topics(client, chat.id, topic_ids=topic_ids)
@@ -546,6 +548,29 @@ async def get_forum_topics(
             break
 
     return topics
+
+
+async def is_forum_chat(client: Client, chat_id: int) -> bool:
+    channel = get_input_channel(await client.resolve_peer(chat_id))
+    if channel is None:
+        return False
+    if isinstance(channel, raw.types.InputChannelEmpty):
+        return False
+
+    try:
+        full_chat = await client.invoke(raw.functions.channels.GetFullChannel(channel=channel))
+    except RPCError:
+        return False
+
+    raw_channel = next(
+        (
+            candidate
+            for candidate in full_chat.chats
+            if isinstance(candidate, raw.types.Channel) and candidate.id == channel.channel_id
+        ),
+        None,
+    )
+    return bool(raw_channel is not None and raw_channel.forum)
 
 
 def get_input_channel(peer: object) -> raw.base.InputChannel | None:

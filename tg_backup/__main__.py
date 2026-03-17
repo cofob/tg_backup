@@ -43,6 +43,10 @@ def configure_logging(state_output_dir: Path) -> None:
     log_handler.setFormatter(log_formatter)
     log.addHandler(log_handler)
 
+    # Pyrogram writes unknown RPC errors to ./unknown_errors.txt.
+    # Use the writable state directory so containerized runs do not fail on /app.
+    os.chdir(state_output_dir)
+
 
 def get_env_name(name: str) -> str:
     return f"{ENV_PREFIX}{name}"
