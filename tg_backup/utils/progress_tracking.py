@@ -2,23 +2,18 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Sequence, Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Generic, TypeVar
 
 
-T = TypeVar("T")
-
-
-class ProgressTracker(Generic[T]):
-
+class ProgressTracker[T]:
     def __init__(
         self,
         sequence: Sequence[T],
         *,
         tracking_file: Path,
         item_name: str = "item",
-        logger: logging.Logger | None = None
+        logger: logging.Logger | None = None,
     ) -> None:
         self.sequence = sequence
         self.tracking_file = tracking_file
@@ -34,7 +29,7 @@ class ProgressTracker(Generic[T]):
             with self.tracking_file.open("r") as f:
                 current_index = json.load(f)
                 if not isinstance(current_index, int):
-                    raise ValueError(
+                    raise TypeError(
                         f"Tracking file content invalid: expected int, got {type(current_index).__name__}."
                     )
         except FileNotFoundError:

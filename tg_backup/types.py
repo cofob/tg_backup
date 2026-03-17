@@ -1,7 +1,6 @@
-from typing import Literal, TypeAlias
+from typing import Literal
 
-
-OpenTextModeUpdating: TypeAlias = Literal[
+type OpenTextModeUpdating = Literal[
     "r+",
     "+r",
     "rt+",
@@ -35,6 +34,6 @@ OpenTextModeUpdating: TypeAlias = Literal[
     "t+x",
     "+tx",
 ]
-OpenTextModeWriting: TypeAlias = Literal["w", "wt", "tw", "a", "at", "ta", "x", "xt", "tx"]
-OpenTextModeReading: TypeAlias = Literal["r", "rt", "tr", "U", "rU", "Ur", "rtU", "rUt", "Urt", "trU", "tUr", "Utr"]
-OpenTextMode: TypeAlias = OpenTextModeUpdating | OpenTextModeWriting | OpenTextModeReading
+type OpenTextModeWriting = Literal["w", "wt", "tw", "a", "at", "ta", "x", "xt", "tx"]
+type OpenTextModeReading = Literal["r", "rt", "tr", "U", "rU", "Ur", "rtU", "rUt", "Urt", "trU", "tUr", "Utr"]
+type OpenTextMode = OpenTextModeUpdating | OpenTextModeWriting | OpenTextModeReading
