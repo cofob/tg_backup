@@ -9,6 +9,7 @@
 - Writes stable JSON and TXT export trees instead of per-run folders.
 - Buckets chat history into weekly files.
 - Downloads attachments from JSON media manifests when enabled.
+- Uses Pyrogram speedups with `TgCrypto` and `uvloop` when available.
 - Can keep running with `--continuous` and append new messages immediately.
 - Can use a Telegram takeout session with `--takeout`.
 
@@ -19,6 +20,11 @@
 - Telegram API credentials from [my.telegram.org](https://my.telegram.org/)
 
 Dependencies and the `tg-backup` console script are declared in [pyproject.toml](/Users/cofob/Development/tg_backup/pyproject.toml).
+
+Pyrogram speedups applied in this repo:
+
+- `TgCrypto` is installed as a project dependency and is picked up automatically by Pyrogram.
+- `uvloop` is installed on Linux and activated before any `pyrogram.Client` instance is created.
 
 ## Installation
 

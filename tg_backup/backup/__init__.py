@@ -479,7 +479,7 @@ async def refresh_forum_topics(
 
     try:
         topics = await get_forum_topics(client, chat.id, topic_ids=topic_ids)
-    except RPCError:
+    except (RPCError, TypeError):
         return
 
     if topic_ids is None:
@@ -504,12 +504,10 @@ async def get_forum_topics(
     *,
     topic_ids: Sequence[int] | None = None,
 ) -> list[ForumTopicEntry]:
-    channel = await client.resolve_peer(chat_id)
-    if not isinstance(
-        channel,
-        (raw.types.InputChannel, raw.types.InputChannelEmpty, raw.types.InputChannelFromMessage),
-    ):
-        raise TypeError(f"Chat {chat_id} could not be resolved to an input channel.")
+    peer = await client.resolve_peer(chat_id)
+    channel = get_input_channel(peer)
+    if channel is None:
+        return []
 
     if topic_ids is not None:
         response = await client.invoke(
@@ -548,6 +546,23 @@ async def get_forum_topics(
             break
 
     return topics
+
+
+def get_input_channel(peer: object) -> raw.base.InputChannel | None:
+    if isinstance(peer, raw.types.InputChannel | raw.types.InputChannelEmpty | raw.types.InputChannelFromMessage):
+        return peer
+    if isinstance(peer, raw.types.InputPeerChannel):
+        return raw.types.InputChannel(
+            channel_id=peer.channel_id,
+            access_hash=peer.access_hash,
+        )
+    if isinstance(peer, raw.types.InputPeerChannelFromMessage):
+        return raw.types.InputChannelFromMessage(
+            peer=peer.peer,
+            msg_id=peer.msg_id,
+            channel_id=peer.channel_id,
+        )
+    return None
 
 
 async def append_chat_history(  # noqa: PLR0913

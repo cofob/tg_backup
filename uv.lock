@@ -196,6 +196,7 @@ dependencies = [
     { name = "adaptix" },
     { name = "json-stream" },
     { name = "pyrogram" },
+    { name = "tgcrypto" },
     { name = "uvloop", marker = "sys_platform == 'linux'" },
 ]
 
@@ -210,6 +211,7 @@ requires-dist = [
     { name = "adaptix", specifier = "==3.0.0b8" },
     { name = "json-stream", specifier = "==2.3.2" },
     { name = "pyrogram", specifier = "==2.0.106" },
+    { name = "tgcrypto" },
     { name = "uvloop", marker = "sys_platform == 'linux'" },
 ]
 
@@ -218,6 +220,12 @@ dev = [
     { name = "mypy", specifier = "~=1.15" },
     { name = "ruff", specifier = "~=0.11" },
 ]
+
+[[package]]
+name = "tgcrypto"
+version = "1.2.5"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/33/59/7cf5ced989e3139a791d5452d58cb8994de589576b80f9267ba76d794f6c/TgCrypto-1.2.5.tar.gz", hash = "sha256:9bc2cac6fb9a12ef5b08f3dd500174fe374d89b660cce981f57e3138559cb682", size = 37280, upload-time = "2022-11-11T19:55:11.436Z" }
 
 [[package]]
 name = "typing-extensions"
