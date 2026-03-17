@@ -1,229 +1,173 @@
 # tg_backup
 
-`tg_backup` is a small Python utility for exporting Telegram chats and downloading chat media through the [Pyrogram](https://docs.pyrogram.org/) client API.
+`tg_backup` exports Telegram chat history with [Pyrogram](https://docs.pyrogram.org/). It writes persistent JSON and TXT exports, keeps per-chat progress in `state.json`, and can continue listening for new messages after the initial sync.
 
-It connects to a Telegram account, enumerates available dialogs, exports chat metadata and message history to JSON, and then downloads referenced media files into a local export directory.
+## Features
 
-## What It Does
-
-For each run, the tool:
-
-1. Starts a Pyrogram client session.
-2. Fetches the list of chats available to the authenticated account.
-3. Exports per-chat metadata and message history.
-4. Extracts media references from messages.
-5. Downloads media files into chat-specific folders.
-6. Stores progress so interrupted runs can resume from the last processed chat.
-
-## Repository Layout
-
-```text
-tg_backup/
-├── README.md
-├── requirements.txt
-└── tg_backup/
-    ├── __main__.py
-    ├── __init__.py
-    ├── types.py
-    ├── backup/
-    │   └── __init__.py
-    └── utils/
-        ├── __init__.py
-        ├── json_streaming.py
-        ├── loading.py
-        └── progress_tracking.py
-```
+- Enumerates chats available to the authenticated Telegram account.
+- Stores per-chat sync progress in `state/state.json`.
+- Writes stable JSON and TXT export trees instead of per-run folders.
+- Buckets chat history into weekly files.
+- Downloads attachments from JSON media manifests when enabled.
+- Can keep running with `--continuous` and append new messages immediately.
+- Can use a Telegram takeout session with `--takeout`.
 
 ## Requirements
 
-- Python 3.11+ is a practical baseline for the current code.
-- A Telegram API ID and API hash from [my.telegram.org](https://my.telegram.org/).
-- A phone number for the Telegram account you want to authenticate.
+- Python 3.13+
+- [`uv`](https://docs.astral.sh/uv/)
+- Telegram API credentials from [my.telegram.org](https://my.telegram.org/)
 
-Runtime dependencies are listed in [requirements.txt](requirements.txt):
-
-- `Pyrogram==2.0.106`
-- `adaptix==3.0.0b8`
-- `json-stream==2.3.2`
-- `uvloop` on Linux only
+Dependencies and the `tg-backup` console script are declared in [pyproject.toml](/Users/cofob/Development/tg_backup/pyproject.toml).
 
 ## Installation
 
-Create and activate a virtual environment, then install dependencies:
-
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-On Windows PowerShell:
-
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+uv sync
 ```
 
 ## Configuration
 
-The application is configured directly in [tg_backup/__main__.py](tg_backup/__main__.py).
+The application reads configuration from environment variables.
 
-Set these module-level constants before running:
-
-```python
-APP_NAME = "tg_backup"
-API_ID = 123456
-API_HASH = "your_api_hash"
-PHONE = "+1234567890"
-```
-
-### Configuration Fields
-
-- `APP_NAME`: Pyrogram session name. This determines the generated session file name.
-- `API_ID`: Telegram API ID from `my.telegram.org`.
-- `API_HASH`: Telegram API hash paired with the API ID.
-- `PHONE`: Phone number for the Telegram account, in international format.
-
-### Important Notes
-
-- Session files are stored locally by Pyrogram and are ignored by git via `.gitignore`.
-- The current code does not read environment variables, `.env` files, or CLI flags.
-- Secrets should not be committed to the repository.
-
-## Running
-
-Run the package as a module from the repository root:
+Required:
 
 ```bash
-python -m tg_backup
+export TG_BACKUP_APP_NAME="tg_backup"
+export TG_BACKUP_API_ID="123456"
+export TG_BACKUP_API_HASH="your_api_hash"
+export TG_BACKUP_PHONE="+1234567890"
 ```
 
-The first run may prompt for Telegram authentication details depending on whether a Pyrogram session already exists.
+Optional:
 
-## Output
+```bash
+export TG_BACKUP_EXPORT_JSON="true"
+export TG_BACKUP_EXPORT_TEXT="true"
+export TG_BACKUP_JSON_EXPORT_ROOT="./json"
+export TG_BACKUP_TEXT_EXPORT_ROOT="./txt"
+export TG_BACKUP_STATE_ROOT="./state"
+export TG_BACKUP_DOWNLOAD_ATTACHMENTS="true"
+```
 
-The tool writes exports to a timestamped directory:
+Notes:
+
+- `TG_BACKUP_EXPORT_JSON` defaults to `true`.
+- `TG_BACKUP_EXPORT_TEXT` defaults to `true`.
+- `TG_BACKUP_DOWNLOAD_ATTACHMENTS` defaults to `true`.
+- `TG_BACKUP_STATE_ROOT` defaults to `./state`.
+- `TG_BACKUP_JSON_EXPORT_ROOT` defaults to `./json`.
+- `TG_BACKUP_TEXT_EXPORT_ROOT` defaults to `./txt`.
+- `TG_BACKUP_DOWNLOAD_ATTACHMENTS=true` requires `TG_BACKUP_EXPORT_JSON=true`.
+- The code reads environment variables directly. It does not load a `.env` file.
+
+## Usage
+
+Run as a module:
+
+```bash
+uv run python -m tg_backup
+```
+
+Or use the installed console script:
+
+```bash
+uv run tg-backup
+```
+
+Available flags:
+
+- `--takeout`: build the Pyrogram client with `takeout=True`.
+- `--continuous`: run the normal sync first, then stay connected and append new messages live.
+
+Examples:
+
+```bash
+uv run python -m tg_backup --takeout
+uv run python -m tg_backup --continuous
+uv run python -m tg_backup --takeout --continuous
+```
+
+## Output Layout
+
+By default the exporter writes into the current working directory:
 
 ```text
-C:/TelegramExports/YYYY-MM-DD_HH-MM-SS/
+state/
+json/
+txt/
 ```
 
-Inside that directory you should expect files similar to:
+Typical layout:
 
 ```text
-process.log
-progress
-chats.json
-chats/
-  <chat_id>/
-    info.json
-    avatars.json
-    messages.json
-    medias.json
-    audios/
-    documents/
-    photos/
-    stickers/
-    videos/
-    voices/
-    ...
+state/
+  process.log
+  state.json
+  <TG_BACKUP_APP_NAME>.session
+  <TG_BACKUP_APP_NAME>.session-journal
+
+json/
+  chats.json
+  chats/
+    <chat_id>/
+      info.json
+      avatars.json
+      YYYY-MM-wN.messages.json
+      YYYY-MM-wN.medias.json
+      <media type folders>/
+    <chat_id>/<thread_id>/
+      YYYY-MM-wN.messages.json
+      YYYY-MM-wN.medias.json
+
+txt/
+  chats.txt
+  chats/
+    <chat_id>/
+      YYYY-MM-wN.txt
+    <chat_id>/<thread_id>/
+      YYYY-MM-wN.txt
 ```
 
-### Exported Files
+Notes:
 
-- `process.log`: Debug and progress logs for the run.
-- `progress`: Last completed chat index for resume support.
-- `chats.json`: Top-level list of discovered chats.
-- `info.json`: Detailed metadata for a single chat.
-- `avatars.json`: Exported chat avatars metadata.
-- `messages.json`: Chat history written as a JSON array.
-- `medias.json`: Metadata for media discovered in the chat.
+- `json/chats.json` maps chat id to chat name for the JSON tree.
+- `txt/chats.txt` stores the same mapping as tab-separated lines.
+- Threaded messages are grouped under `<thread_id>/` when `reply_to_top_message_id` is present.
+- Weekly buckets use the form `YYYY-MM-wN`.
+- Attachment downloads are stored under the JSON chat directory because media metadata comes from `*.medias.json`.
+- Media folder names are derived from Pyrogram file types plus `unknown_files`.
 
-## How Resume Works
+## Sync Behavior
 
-The tool uses [tg_backup/utils/progress_tracking.py](tg_backup/utils/progress_tracking.py) to persist the last completed chat index in the `progress` file.
+On the first run the exporter:
 
-If a run is interrupted:
+1. Authenticates with Telegram.
+2. Builds or refreshes `state/state.json` with the current chat list.
+3. Backfills each chat until the oldest reachable message returned by Telegram.
+4. Appends JSON/TXT output to the stable export tree.
+5. Optionally downloads attachments from the JSON media manifests.
 
-- already completed chats are skipped on the next run
-- the export continues from the next chat index
+On later runs:
 
-This resume logic is chat-based, not message-based.
+- chats with unfinished history resume from their last known `oldest_message_id`
+- chats with completed history fetch only newer messages after `latest_message_id`
+- mapping files and state are refreshed as chat metadata changes
 
-## Development Notes
+With `--continuous`, after the sync phase the process stays connected, listens for new messages on all chats, appends them immediately, updates `state.json`, and downloads new attachments when enabled.
 
-This repository is currently a lightweight script-style project:
+## State And Session Files
 
-- no `pyproject.toml`
-- no packaging metadata
-- no automated tests
-- no CLI argument parser
-- no environment-based configuration layer
+- `state/state.json` stores the chat list and per-chat progress fields such as `history_complete`, `oldest_message_id`, and `latest_message_id`.
+- Pyrogram session files are stored in `TG_BACKUP_STATE_ROOT` because the client `workdir` is set to that directory.
+- `state/process.log` contains exporter logs.
 
-Most of the application logic lives in [tg_backup/backup/__init__.py](tg_backup/backup/__init__.py).
+## Docker And CI
 
-## Platform Notes
-
-- The export path is currently hardcoded to `C:/TelegramExports/...`.
-- That path is Windows-oriented. On Linux or macOS, you will likely want to change the output directory in [tg_backup/__main__.py](tg_backup/__main__.py) before running.
-- On Linux, `uvloop` is installed and enabled when available.
+The repository includes [Dockerfile](/Users/cofob/Development/tg_backup/Dockerfile) and publishes `ghcr.io/cofob/tg-backup` from GitHub Actions on push via [ci.yml](/Users/cofob/Development/tg_backup/.github/workflows/ci.yml).
 
 ## Limitations
 
-Current limitations visible in the codebase:
-
-- Configuration is hardcoded in source code.
-- `load_medias()` is present but not implemented.
-- Media download logging reports a total count of zero because the current counter is not updated.
-- The project depends directly on Pyrogram behavior and some internal types.
-
-## Deployment
-
-There is no deployment packaging, service definition, or container setup in this repository today. The practical deployment model is "run it as a local script on a machine that has access to your Telegram credentials and enough disk space for exports."
-
-### Recommended Local Deployment Workflow
-
-1. Clone the repository onto the machine that will perform backups.
-2. Create a virtual environment.
-3. Install dependencies from `requirements.txt`.
-4. Edit [tg_backup/__main__.py](tg_backup/__main__.py) with your Telegram credentials.
-5. Adjust the export output path if needed.
-6. Run `python -m tg_backup`.
-7. Keep the generated Pyrogram session file private.
-
-### Operational Considerations
-
-- Large chat histories can produce large JSON files and significant media storage usage.
-- Telegram rate limits may trigger `FloodWait` handling during some operations.
-- Re-running the tool may skip some work based on existing output files and the progress tracker.
-- The export directory should be placed on reliable storage with enough free capacity.
-
-## Debugging
-
-The repository includes a VS Code launch configuration in [.vscode/launch.json](.vscode/launch.json) with a module-based `tg_backup` debug target.
-
-Primary troubleshooting sources:
-
-- `process.log` in the export directory
-- console output during execution
-- Pyrogram authentication/session prompts
-
-## Future Improvements
-
-Useful next steps for the project would be:
-
-- move credentials to environment variables or a config file
-- add a proper CLI
-- make the output directory configurable
-- add tests for JSON streaming and progress tracking
-- add packaging metadata and a lockfile
-- improve media download accounting and reporting
-
-## Safety
-
-This project handles private Telegram data. Treat exported JSON, media files, and session files as sensitive.
-
-- Do not commit credentials.
-- Do not publish export artifacts.
-- Protect the machine and disk location where backups are stored.
+- Export completeness is bounded by what Telegram currently returns for a chat; the oldest available message id is not guaranteed to be `1`.
+- Continuous mode depends on Pyrogram update delivery while the process is running.
+- The project still has limited automated coverage.
