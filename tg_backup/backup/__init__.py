@@ -505,8 +505,11 @@ async def get_forum_topics(
     topic_ids: Sequence[int] | None = None,
 ) -> list[ForumTopicEntry]:
     channel = await client.resolve_peer(chat_id)
-    if not isinstance(channel, (raw.types.InputChannel, raw.types.InputChannelEmpty, raw.types.InputChannelFromMessage)):
-        raise ValueError(f"Chat {chat_id} could not be resolved to an input channel.")
+    if not isinstance(
+        channel,
+        (raw.types.InputChannel, raw.types.InputChannelEmpty, raw.types.InputChannelFromMessage),
+    ):
+        raise TypeError(f"Chat {chat_id} could not be resolved to an input channel.")
 
     if topic_ids is not None:
         response = await client.invoke(
