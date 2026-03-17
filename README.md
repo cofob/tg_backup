@@ -113,6 +113,7 @@ json/
     <chat_id>/
       info.json
       avatars.json
+      topics.json
       YYYY-MM-wN.messages.json
       YYYY-MM-wN.medias.json
       <media type folders>/
@@ -124,6 +125,7 @@ txt/
   chats.txt
   chats/
     <chat_id>/
+      topics.txt
       YYYY-MM-wN.txt
     <chat_id>/<thread_id>/
       YYYY-MM-wN.txt
@@ -133,6 +135,7 @@ Notes:
 
 - `json/chats.json` maps chat id to chat name for the JSON tree.
 - `txt/chats.txt` stores the same mapping as tab-separated lines.
+- Forum chats also get per-chat topic mappings in `json/chats/<chat_id>/topics.json` and `txt/chats/<chat_id>/topics.txt`.
 - Threaded messages are grouped under `<thread_id>/` when `reply_to_top_message_id` is present.
 - Weekly buckets use the form `YYYY-MM-wN`.
 - Attachment downloads are stored under the JSON chat directory because media metadata comes from `*.medias.json`.

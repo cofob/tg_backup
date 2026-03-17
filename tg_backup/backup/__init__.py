@@ -16,9 +16,9 @@ from typing import BinaryIO, NamedTuple, Protocol, TypeAlias, TypeVar
 
 from adaptix import Retort
 from json_stream import load, to_standard_types
-from pyrogram import Client
+from pyrogram import Client, raw
 from pyrogram.enums import ChatType
-from pyrogram.errors import FloodWait, UserIdInvalid
+from pyrogram.errors import FloodWait, RPCError, UserIdInvalid
 from pyrogram.file_id import PHOTO_TYPES, FileId, FileType
 from pyrogram.types import (
     Animation,
@@ -45,6 +45,7 @@ type TGMedia = Audio | Document | Photo | Sticker | Animation | Video | Voice | 
 DEFAULT_ENCODING = "utf-8"
 DEFAULT_JSON_INDENT = 2
 TELEGRAM_BACKOFF_TIME = 30
+FORUM_TOPICS_PAGE_SIZE = 100
 STATE_FILE_NAME = "state.json"
 
 IMAGE_EXTS = dict.fromkeys(PHOTO_TYPES, ".jpg")
@@ -103,6 +104,12 @@ class BackupSession:
     export_json: bool
     export_text: bool
     download_attachments: bool
+
+
+@dataclass(frozen=True)
+class ForumTopicEntry:
+    id: int
+    title: str
 
 
 @dataclass(frozen=True)
@@ -191,6 +198,15 @@ async def backup(
         if export_json and json_chat_dir is not None:
             json_chat_dir.mkdir(parents=True, exist_ok=True)
             await dump_chat_json_metadata(client=client, chat=chat, json_chat_dir=json_chat_dir)
+        if export_text and text_chat_dir is not None:
+            text_chat_dir.mkdir(parents=True, exist_ok=True)
+
+        await refresh_forum_topics(
+            client,
+            chat=chat,
+            json_chat_dir=json_chat_dir,
+            text_chat_dir=text_chat_dir,
+        )
 
         if chat_state.history_complete:
             await append_recent_messages(
@@ -367,6 +383,170 @@ def dump_export_chat_mappings(
                 fp.write("\n")
 
 
+def get_topics_json_path(json_chat_dir: Path) -> Path:
+    return json_chat_dir / "topics.json"
+
+
+def get_topics_txt_path(text_chat_dir: Path) -> Path:
+    return text_chat_dir / "topics.txt"
+
+
+def load_existing_forum_topics(*, json_chat_dir: Path | None, text_chat_dir: Path | None) -> list[ForumTopicEntry]:
+    if json_chat_dir is not None:
+        topics_json = get_topics_json_path(json_chat_dir)
+        if topics_json.exists():
+            with topics_json.open("r", encoding=DEFAULT_ENCODING) as fp:
+                raw_topics = json.load(fp)
+            if isinstance(raw_topics, dict):
+                topics: list[ForumTopicEntry] = []
+                for topic_id, topic_title in raw_topics.items():
+                    if not isinstance(topic_id, str) or not isinstance(topic_title, str):
+                        continue
+                    try:
+                        parsed_topic_id = int(topic_id)
+                    except ValueError:
+                        continue
+                    topics.append(ForumTopicEntry(id=parsed_topic_id, title=topic_title))
+                return sorted(topics, key=lambda topic: topic.id)
+
+    if text_chat_dir is not None:
+        topics_txt = get_topics_txt_path(text_chat_dir)
+        if topics_txt.exists():
+            topics = []
+            for line in topics_txt.read_text(encoding=DEFAULT_ENCODING).splitlines():
+                if not line.strip():
+                    continue
+                topic_id, separator, topic_title = line.partition("\t")
+                if not separator:
+                    continue
+                try:
+                    parsed_topic_id = int(topic_id)
+                except ValueError:
+                    continue
+                topics.append(ForumTopicEntry(id=parsed_topic_id, title=topic_title))
+            return sorted(topics, key=lambda topic: topic.id)
+
+    return []
+
+
+def dump_forum_topics(
+    topics: list[ForumTopicEntry],
+    *,
+    json_chat_dir: Path | None,
+    text_chat_dir: Path | None,
+) -> None:
+    sorted_topics = sorted(topics, key=lambda topic: topic.id)
+
+    if json_chat_dir is not None:
+        topics_json = get_topics_json_path(json_chat_dir)
+        topics_json.parent.mkdir(parents=True, exist_ok=True)
+        payload = {str(topic.id): topic.title for topic in sorted_topics}
+        with topics_json.open("w", encoding=DEFAULT_ENCODING) as fp:
+            json.dump(payload, fp, indent=DEFAULT_JSON_INDENT, ensure_ascii=False)
+
+    if text_chat_dir is not None:
+        topics_txt = get_topics_txt_path(text_chat_dir)
+        topics_txt.parent.mkdir(parents=True, exist_ok=True)
+        lines = [f"{topic.id}\t{topic.title}" for topic in sorted_topics]
+        with topics_txt.open("w", encoding=DEFAULT_ENCODING) as fp:
+            fp.write("\n".join(lines))
+            if lines:
+                fp.write("\n")
+
+
+def forum_topic_exists(topic_id: int, *, json_chat_dir: Path | None, text_chat_dir: Path | None) -> bool:
+    return any(
+        topic.id == topic_id
+        for topic in load_existing_forum_topics(
+            json_chat_dir=json_chat_dir,
+            text_chat_dir=text_chat_dir,
+        )
+    )
+
+
+async def refresh_forum_topics(
+    client: Client,
+    *,
+    chat: Chat,
+    json_chat_dir: Path | None,
+    text_chat_dir: Path | None,
+    topic_ids: Sequence[int] | None = None,
+) -> None:
+    if json_chat_dir is None and text_chat_dir is None:
+        return
+    if chat.type is not ChatType.SUPERGROUP:
+        return
+
+    try:
+        topics = await get_forum_topics(client, chat.id, topic_ids=topic_ids)
+    except RPCError:
+        return
+
+    if topic_ids is None:
+        dump_forum_topics(topics, json_chat_dir=json_chat_dir, text_chat_dir=text_chat_dir)
+        return
+
+    merged_topics = {
+        topic.id: topic
+        for topic in load_existing_forum_topics(
+            json_chat_dir=json_chat_dir,
+            text_chat_dir=text_chat_dir,
+        )
+    }
+    for topic in topics:
+        merged_topics[topic.id] = topic
+    dump_forum_topics(list(merged_topics.values()), json_chat_dir=json_chat_dir, text_chat_dir=text_chat_dir)
+
+
+async def get_forum_topics(
+    client: Client,
+    chat_id: int,
+    *,
+    topic_ids: Sequence[int] | None = None,
+) -> list[ForumTopicEntry]:
+    channel = await client.resolve_peer(chat_id)
+    if not isinstance(channel, (raw.types.InputChannel, raw.types.InputChannelEmpty, raw.types.InputChannelFromMessage)):
+        raise ValueError(f"Chat {chat_id} could not be resolved to an input channel.")
+
+    if topic_ids is not None:
+        response = await client.invoke(
+            raw.functions.channels.GetForumTopicsByID(
+                channel=channel,
+                topics=list(topic_ids),
+            )
+        )
+        return [ForumTopicEntry(id=topic.id, title=topic.title) for topic in response.topics]
+
+    topics: list[ForumTopicEntry] = []
+    offset_date = 0
+    offset_id = 0
+    offset_topic = 0
+
+    while True:
+        response = await client.invoke(
+            raw.functions.channels.GetForumTopics(
+                channel=channel,
+                offset_date=offset_date,
+                offset_id=offset_id,
+                offset_topic=offset_topic,
+                limit=FORUM_TOPICS_PAGE_SIZE,
+            )
+        )
+        if not response.topics:
+            break
+
+        topics.extend(ForumTopicEntry(id=topic.id, title=topic.title) for topic in response.topics)
+        last_topic = response.topics[-1]
+        offset_date = last_topic.date
+        offset_id = last_topic.top_message
+        offset_topic = last_topic.id
+
+        if len(response.topics) < FORUM_TOPICS_PAGE_SIZE:
+            break
+
+    return topics
+
+
 async def append_chat_history(  # noqa: PLR0913
     client: Client,
     chat: Chat,
@@ -460,6 +640,22 @@ async def append_live_message(client: Client, message: Message, *, session: Back
         info_json = json_chat_dir / "info.json"
         if not info_json.exists():
             await dump_chat_json_metadata(client=client, chat=chat, json_chat_dir=json_chat_dir)
+    if session.export_text and text_chat_dir is not None:
+        text_chat_dir.mkdir(parents=True, exist_ok=True)
+
+    thread_id = get_thread_id(message)
+    if thread_id is not None and not forum_topic_exists(
+        thread_id,
+        json_chat_dir=json_chat_dir,
+        text_chat_dir=text_chat_dir,
+    ):
+        await refresh_forum_topics(
+            client,
+            chat=chat,
+            json_chat_dir=json_chat_dir,
+            text_chat_dir=text_chat_dir,
+            topic_ids=[thread_id],
+        )
 
     append_export_batch(
         messages=[message],
