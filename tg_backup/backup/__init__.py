@@ -47,6 +47,8 @@ DEFAULT_JSON_INDENT = 2
 TELEGRAM_BACKOFF_TIME = 30
 FORUM_TOPICS_PAGE_SIZE = 100
 STATE_FILE_NAME = "state.json"
+UNKNOWN_WEEK_BUCKET = "unknown"
+UNKNOWN_TEXT_TIMESTAMP = "unknown"
 
 IMAGE_EXTS = dict.fromkeys(PHOTO_TYPES, ".jpg")
 ANIMATED_EXTS = dict.fromkeys((FileType.VIDEO, FileType.ANIMATION, FileType.VIDEO_NOTE), ".mp4")
@@ -912,7 +914,7 @@ def get_message_author_label(message: Message) -> str:
 
 
 def render_text_record(message: Message, body: str) -> str:
-    timestamp = message.date.strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = format_message_timestamp(message.date)
     sender = get_message_author_label(message)
     return f"[{timestamp}] {sender}: {body}\n\n"
 
@@ -921,7 +923,15 @@ def get_thread_id(message: Message) -> int | None:
     return message.reply_to_top_message_id
 
 
-def get_week_bucket(date: dt) -> str:
+def format_message_timestamp(date: dt | None) -> str:
+    if date is None:
+        return UNKNOWN_TEXT_TIMESTAMP
+    return date.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_week_bucket(date: dt | None) -> str:
+    if date is None:
+        return UNKNOWN_WEEK_BUCKET
     week_of_month = ((date.day - 1) // 7) + 1
     return f"{date:%Y-%m}-w{week_of_month}"
 
