@@ -466,6 +466,21 @@ def forum_topic_exists(topic_id: int, *, json_chat_dir: Path | None, text_chat_d
     )
 
 
+def forum_topic_entry(topic: raw.base.ForumTopic) -> ForumTopicEntry | None:
+    if isinstance(topic, raw.types.ForumTopic):
+        return ForumTopicEntry(id=topic.id, title=topic.title)
+    return None
+
+
+def forum_topic_entries(topics: Iterable[raw.base.ForumTopic]) -> list[ForumTopicEntry]:
+    entries: list[ForumTopicEntry] = []
+    for topic in topics:
+        entry = forum_topic_entry(topic)
+        if entry is not None:
+            entries.append(entry)
+    return entries
+
+
 async def refresh_forum_topics(
     client: Client,
     *,
@@ -520,7 +535,7 @@ async def get_forum_topics(
                 topics=list(topic_ids),
             )
         )
-        return [ForumTopicEntry(id=topic.id, title=topic.title) for topic in response.topics]
+        return forum_topic_entries(response.topics)
 
     topics: list[ForumTopicEntry] = []
     offset_date = 0
@@ -540,8 +555,13 @@ async def get_forum_topics(
         if not response.topics:
             break
 
-        topics.extend(ForumTopicEntry(id=topic.id, title=topic.title) for topic in response.topics)
-        last_topic = response.topics[-1]
+        topics.extend(forum_topic_entries(response.topics))
+        last_topic = next(
+            (topic for topic in reversed(response.topics) if isinstance(topic, raw.types.ForumTopic)),
+            None,
+        )
+        if last_topic is None:
+            break
         offset_date = last_topic.date
         offset_id = last_topic.top_message
         offset_topic = last_topic.id
