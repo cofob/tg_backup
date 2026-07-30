@@ -4,6 +4,7 @@ import asyncio
 import bisect
 import json
 import logging
+import os
 from collections import defaultdict
 from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from contextlib import suppress
@@ -12,7 +13,7 @@ from datetime import UTC
 from datetime import datetime as dt
 from functools import cached_property
 from pathlib import Path
-from typing import BinaryIO, NamedTuple, Protocol, TypeAlias, TypeVar
+from typing import NamedTuple, Protocol, TypeAlias, TypeVar
 
 from adaptix import Retort
 from json_stream import load, to_standard_types
@@ -804,50 +805,154 @@ def append_json_objects(path: Path, items: Iterable[object], *, default: Callabl
         return
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    encoded_items = [item.encode(DEFAULT_ENCODING) for item in dumped_items]
+    existing_items: list[object] = []
+    existing_prefix = b"["
+    repaired = False
 
-    if not path.exists() or path.stat().st_size == 0:
-        with path.open("wb") as fp:
-            fp.write(b"[")
-            fp.write(b",\n".join(encoded_items))
-            fp.write(b"]")
+    if path.exists() and path.stat().st_size > 0:
+        existing_items, existing_prefix, repaired = read_json_list_for_append(path)
+
+    dumped_values = [json.loads(item) for item in dumped_items]
+    overlap = json_list_tail_overlap(existing_items, dumped_values)
+    if overlap:
+        log.info("Skipping %s already exported item(s) in %s.", overlap, path)
+        dumped_items = dumped_items[overlap:]
+
+    if not dumped_items and not repaired:
         return
 
-    with path.open("rb+") as fp:
-        list_end_position = find_json_list_end(fp)
-        need_separator = json_list_has_items(fp, list_end_position)
-        fp.seek(list_end_position)
-        fp.truncate()
-        if need_separator:
-            fp.write(b",\n")
-        fp.write(b",\n".join(encoded_items))
-        fp.write(b"]")
+    encoded_items = [item.encode(DEFAULT_ENCODING) for item in dumped_items]
+    write_json_list_atomic(
+        path,
+        existing_prefix=existing_prefix,
+        encoded_items=encoded_items,
+        need_separator=bool(existing_items),
+        backup_existing=repaired,
+    )
 
 
-def find_json_list_end(fp: BinaryIO) -> int:
-    fp.seek(0, 2)
-    position = fp.tell() - 1
-    while position >= 0:
-        fp.seek(position)
-        chunk = fp.read(1)
-        if chunk not in b" \t\r\n":
-            if chunk != b"]":
-                raise ValueError("Expected JSON list file to end with ']'.")
-            return position
-        position -= 1
-    raise ValueError("Expected a non-empty JSON list file.")
+def read_json_list_for_append(path: Path) -> tuple[list[object], bytes, bool]:
+    content = path.read_bytes()
+    try:
+        parsed = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        parsed = None
+
+    if isinstance(parsed, list):
+        content_without_trailing_space = content.rstrip()
+        return parsed, content_without_trailing_space[:-1], False
+
+    recovered_items = recover_json_list_prefix(content)
+    log.warning(
+        "Auto-healed corrupted JSON export %s: recovered %s complete item(s).",
+        path,
+        len(recovered_items),
+    )
+    return recovered_items, encode_json_list_prefix(recovered_items), True
 
 
-def json_list_has_items(fp: BinaryIO, list_end_position: int) -> bool:
-    position = list_end_position - 1
-    while position >= 0:
-        fp.seek(position)
-        chunk = fp.read(1)
-        if chunk in b" \t\r\n":
-            position -= 1
-            continue
-        return chunk != b"["
-    return False
+def recover_json_list_prefix(content: bytes) -> list[object]:
+    try:
+        text = content.decode(DEFAULT_ENCODING)
+    except UnicodeDecodeError as error:
+        text = content[: error.start].decode(DEFAULT_ENCODING)
+
+    position = skip_json_whitespace(text, 0)
+    if position >= len(text) or text[position] != "[":
+        return []
+
+    decoder = json.JSONDecoder()
+    position += 1
+    recovered: list[object] = []
+    while True:
+        position = skip_json_whitespace(text, position)
+        if position >= len(text) or text[position] == "]":
+            return recovered
+
+        try:
+            item, position = decoder.raw_decode(text, position)
+        except json.JSONDecodeError:
+            return recovered
+        recovered.append(item)
+
+        position = skip_json_whitespace(text, position)
+        if position >= len(text):
+            return recovered
+        if text[position] == "]":
+            return recovered
+        if text[position] != ",":
+            return recovered
+        position += 1
+
+
+def skip_json_whitespace(text: str, position: int) -> int:
+    while position < len(text) and text[position] in " \t\r\n":
+        position += 1
+    return position
+
+
+def encode_json_list_prefix(items: list[object]) -> bytes:
+    if not items:
+        return b"["
+    dumped_items = [
+        json.dumps(item, indent=DEFAULT_JSON_INDENT, ensure_ascii=False).encode(DEFAULT_ENCODING) for item in items
+    ]
+    return b"[" + b",\n".join(dumped_items)
+
+
+def json_list_tail_overlap(existing_items: list[object], new_items: list[object]) -> int:
+    max_overlap = min(len(existing_items), len(new_items))
+    for overlap in range(max_overlap, 0, -1):
+        if existing_items[-overlap:] == new_items[:overlap]:
+            return overlap
+    return 0
+
+
+def write_json_list_atomic(
+    path: Path,
+    *,
+    existing_prefix: bytes,
+    encoded_items: list[bytes],
+    need_separator: bool,
+    backup_existing: bool,
+) -> None:
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    backup_path: Path | None = None
+    try:
+        with temporary_path.open("wb") as fp:
+            fp.write(existing_prefix)
+            if encoded_items:
+                if need_separator:
+                    fp.write(b",\n")
+                fp.write(b",\n".join(encoded_items))
+            fp.write(b"]")
+            fp.flush()
+            os.fsync(fp.fileno())
+
+        if backup_existing and path.exists():
+            backup_path = get_corrupt_export_backup_path(path)
+            path.replace(backup_path)
+
+        try:
+            temporary_path.replace(path)
+        except OSError:
+            if backup_path is not None and not path.exists():
+                backup_path.replace(path)
+            raise
+
+        if backup_path is not None:
+            log.warning("Preserved corrupted JSON export as %s.", backup_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def get_corrupt_export_backup_path(path: Path) -> Path:
+    backup_path = path.with_name(f"{path.name}.corrupt.bak")
+    counter = 1
+    while backup_path.exists():
+        backup_path = path.with_name(f"{path.name}.corrupt.{counter}.bak")
+        counter += 1
+    return backup_path
 
 
 async def dump_chat_json_metadata(client: Client, chat: Chat, *, json_chat_dir: Path) -> None:
