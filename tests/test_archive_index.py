@@ -175,6 +175,84 @@ class MessageSnapshotFactoryTests(unittest.TestCase):
 
         assert restored == MessageSnapshot.from_message(message)
 
+    def test_legacy_numeric_custom_emoji_id_is_normalized(self) -> None:
+        payload = {
+            "id": 9,
+            "date": str(SENT_AT),
+            "text": "legacy custom emoji",
+            "entities": [
+                {
+                    "type": "MessageEntityType.CUSTOM_EMOJI",
+                    "offset": 7,
+                    "length": 2,
+                    "custom_emoji_id": 5373141891321699086,
+                }
+            ],
+        }
+
+        restored = MessageSnapshot.from_export_payload(payload, chat_id=-100123, is_channel=True)
+
+        assert restored.entities == (
+            EntitySnapshot(
+                kind="CUSTOM_EMOJI",
+                offset=7,
+                length=2,
+                custom_emoji_id="5373141891321699086",
+            ),
+        )
+
+    def test_legacy_entity_aliases_and_numeric_strings_are_supported(self) -> None:
+        payload = {
+            "id": 9,
+            "date": str(SENT_AT),
+            "message_thread_id": "42",
+            "text": "legacy",
+            "entities": [
+                {
+                    "kind": "DATE_TIME",
+                    "offset": "0",
+                    "length": "6",
+                    "user_id": "123456",
+                    "document_id": 987654321,
+                    "collapsed": True,
+                    "date": "1785844800",
+                    "date_time_format": "r",
+                }
+            ],
+        }
+
+        restored = MessageSnapshot.from_export_payload(payload, chat_id=-100123, is_channel=True)
+
+        assert restored.thread_id == 42
+        assert restored.entities == (
+            EntitySnapshot(
+                kind="DATE_TIME",
+                offset=0,
+                length=6,
+                user_id=123456,
+                custom_emoji_id="987654321",
+                expandable=True,
+                unix_time=1785844800,
+                date_time_format="r",
+            ),
+        )
+
+    def test_invalid_legacy_field_names_the_exact_field_and_type(self) -> None:
+        payload = {
+            "id": 9,
+            "entities": [
+                {
+                    "type": "MessageEntityType.TEXT_LINK",
+                    "offset": 0,
+                    "length": 4,
+                    "url": {"unexpected": "object"},
+                }
+            ],
+        }
+
+        with self.assertRaisesRegex(ValueError, r"entity\.url.*dict"):  # noqa: PT027 - unittest suite.
+            MessageSnapshot.from_export_payload(payload, chat_id=-100123, is_channel=True)
+
 
 class OriginalIndexTests(ArchiveIndexTestCase):
     def test_original_head_and_exact_version_persist_across_reopen(self) -> None:

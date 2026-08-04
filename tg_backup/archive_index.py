@@ -150,9 +150,17 @@ class MessageSnapshot:
         message_id = payload.get("id")
         if not isinstance(message_id, int) or isinstance(message_id, bool):
             raise TypeError("Exported message id must be an integer.")
-        thread_id = _optional_integer(payload.get("reply_to_top_message_id"))
+        thread_id = _optional_integer(
+            payload.get("reply_to_top_message_id"),
+            field_name="reply_to_top_message_id",
+            allow_numeric_string=True,
+        )
         if thread_id is None:
-            thread_id = _optional_integer(payload.get("message_thread_id"))
+            thread_id = _optional_integer(
+                payload.get("message_thread_id"),
+                field_name="message_thread_id",
+                allow_numeric_string=True,
+            )
         media_kind, media_id = _export_media_identity(payload)
         return cls(
             chat_id=chat_id,
@@ -161,8 +169,8 @@ class MessageSnapshot:
             sent_at=_export_datetime(payload.get("date")),
             thread_id=thread_id,
             edit_date=_export_datetime(payload.get("edit_date")),
-            text=_optional_string(payload.get("text")),
-            caption=_optional_string(payload.get("caption")),
+            text=_optional_string(payload.get("text"), field_name="text"),
+            caption=_optional_string(payload.get("caption"), field_name="caption"),
             entities=_export_entities(payload.get("entities")),
             caption_entities=_export_entities(payload.get("caption_entities")),
             media_kind=media_kind,
@@ -1092,25 +1100,60 @@ def _export_entities(value: object) -> tuple[EntitySnapshot, ...]:
     for raw_entity in value:
         if not isinstance(raw_entity, Mapping):
             raise TypeError("Exported message entity must be a JSON object.")
-        kind_raw = raw_entity.get("type")
-        offset = raw_entity.get("offset")
-        length = raw_entity.get("length")
-        if not isinstance(kind_raw, str) or not isinstance(offset, int) or not isinstance(length, int):
+        kind_raw = _first_non_null(raw_entity, "type", "kind", "_")
+        if not isinstance(kind_raw, str):
             raise TypeError("Exported message entity has invalid required fields.")
+        offset = _required_integer(
+            raw_entity.get("offset"),
+            field_name="entity.offset",
+            allow_numeric_string=True,
+        )
+        length = _required_integer(
+            raw_entity.get("length"),
+            field_name="entity.length",
+            allow_numeric_string=True,
+        )
         user_raw = raw_entity.get("user")
-        user_id = _optional_integer(user_raw.get("id")) if isinstance(user_raw, Mapping) else None
+        if isinstance(user_raw, Mapping):
+            user_id_raw = user_raw.get("id")
+        elif user_raw is not None:
+            # Older Pyrogram/Kurigram exports could store the referenced user
+            # directly instead of embedding the full User object.
+            user_id_raw = user_raw
+        else:
+            user_id_raw = raw_entity.get("user_id")
+        user_id = _optional_integer(
+            user_id_raw,
+            field_name="entity.user_id",
+            allow_numeric_string=True,
+        )
+        custom_emoji_id = _optional_string(
+            _first_non_null(raw_entity, "custom_emoji_id", "document_id"),
+            field_name="entity.custom_emoji_id",
+            allow_integer=True,
+        )
         snapshots.append(
             EntitySnapshot(
                 kind=kind_raw.rsplit(".", maxsplit=1)[-1],
                 offset=offset,
                 length=length,
-                url=_optional_string(raw_entity.get("url")),
+                url=_optional_string(raw_entity.get("url"), field_name="entity.url"),
                 user_id=user_id,
-                language=_optional_string(raw_entity.get("language")),
-                custom_emoji_id=_optional_string(raw_entity.get("custom_emoji_id")),
-                expandable=_optional_boolean(raw_entity.get("expandable")),
-                unix_time=_optional_integer(raw_entity.get("unix_time")),
-                date_time_format=_optional_string(raw_entity.get("date_time_format")),
+                language=_optional_string(raw_entity.get("language"), field_name="entity.language"),
+                custom_emoji_id=custom_emoji_id,
+                expandable=_optional_boolean(
+                    _first_non_null(raw_entity, "expandable", "collapsed"),
+                    field_name="entity.expandable",
+                ),
+                unix_time=_optional_integer(
+                    _first_non_null(raw_entity, "unix_time", "date"),
+                    field_name="entity.unix_time",
+                    allow_numeric_string=True,
+                ),
+                date_time_format=_optional_string(
+                    raw_entity.get("date_time_format"),
+                    field_name="entity.date_time_format",
+                ),
             )
         )
     return tuple(snapshots)
@@ -1204,13 +1247,20 @@ def _entity_from_mapping(item: Mapping[object, object]) -> EntitySnapshot:
         kind=kind,
         offset=offset,
         length=length,
-        url=_optional_string(item.get("url")),
-        user_id=_optional_integer(item.get("user_id")),
-        language=_optional_string(item.get("language")),
-        custom_emoji_id=_optional_string(item.get("custom_emoji_id")),
-        expandable=_optional_boolean(item.get("expandable")),
-        unix_time=_optional_integer(item.get("unix_time")),
-        date_time_format=_optional_string(item.get("date_time_format")),
+        url=_optional_string(item.get("url"), field_name="stored entity.url"),
+        user_id=_optional_integer(item.get("user_id"), field_name="stored entity.user_id"),
+        language=_optional_string(item.get("language"), field_name="stored entity.language"),
+        custom_emoji_id=_optional_string(
+            item.get("custom_emoji_id"),
+            field_name="stored entity.custom_emoji_id",
+            allow_integer=True,
+        ),
+        expandable=_optional_boolean(item.get("expandable"), field_name="stored entity.expandable"),
+        unix_time=_optional_integer(item.get("unix_time"), field_name="stored entity.unix_time"),
+        date_time_format=_optional_string(
+            item.get("date_time_format"),
+            field_name="stored entity.date_time_format",
+        ),
     )
 
 
@@ -1346,19 +1396,45 @@ def _is_observably_stale(previous: datetime | None, current: datetime | None) ->
     return previous is not None and current is not None and current < previous
 
 
-def _optional_string(value: object) -> str | None:
+def _first_non_null(mapping: Mapping[object, object], *names: str) -> object:
+    for name in names:
+        value = mapping.get(name)
+        if value is not None:
+            return value
+    return None
+
+
+def _optional_string(value: object, *, field_name: str, allow_integer: bool = False) -> str | None:
     if value is None or isinstance(value, str):
         return value
-    raise ValueError("Stored message entity string field has an invalid type.")
+    if allow_integer and isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    expected = "a string, integer, or null" if allow_integer else "a string or null"
+    raise ValueError(f"{field_name} must be {expected}; got {type(value).__name__}.")
 
 
-def _optional_integer(value: object) -> int | None:
-    if value is None or isinstance(value, int):
+def _required_integer(value: object, *, field_name: str, allow_numeric_string: bool = False) -> int:
+    result = _optional_integer(value, field_name=field_name, allow_numeric_string=allow_numeric_string)
+    if result is None:
+        raise ValueError(f"{field_name} must not be null.")
+    return result
+
+
+def _optional_integer(value: object, *, field_name: str, allow_numeric_string: bool = False) -> int | None:
+    if value is None:
         return value
-    raise ValueError("Stored message entity integer field has an invalid type.")
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if allow_numeric_string and isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            pass
+    expected = "an integer, numeric string, or null" if allow_numeric_string else "an integer or null"
+    raise ValueError(f"{field_name} must be {expected}; got {type(value).__name__}.")
 
 
-def _optional_boolean(value: object) -> bool | None:
+def _optional_boolean(value: object, *, field_name: str) -> bool | None:
     if value is None or isinstance(value, bool):
         return value
-    raise ValueError("Stored message entity boolean field has an invalid type.")
+    raise ValueError(f"{field_name} must be a boolean or null; got {type(value).__name__}.")

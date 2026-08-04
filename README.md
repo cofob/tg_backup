@@ -174,7 +174,7 @@ On later runs:
 - chats with unfinished history resume from their last known `oldest_message_id`
 - chats with completed history fetch only newer messages after `latest_message_id`
 - mapping files and state are refreshed as chat metadata changes
-- existing `*.messages.json` files are imported into the archive index once, so upgrades retain legacy text as the baseline for later edit events
+- existing `*.messages.json` files are imported into the archive index once, so upgrades retain legacy text as the baseline for later edit events; older numeric Telegram IDs and legacy entity field names are normalized during import
 - failed chats are recorded in state and do not prevent remaining chats from syncing
 - failed or interrupted media downloads remain indexed for a later retry
 

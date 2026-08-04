@@ -181,6 +181,47 @@ class MessageEventTests(unittest.TestCase):
             modified_ns=stat.st_mtime_ns,
         )
 
+    def test_legacy_numeric_entity_ids_import_once_without_retrying_manifest(self) -> None:
+        self.json_chat_dir.mkdir(parents=True)
+        manifest_path = self.json_chat_dir / "2026-08-w1.messages.json"
+        manifest_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "id": MESSAGE_ID,
+                        "date": str(self.sent_at),
+                        "text": "legacy custom emoji",
+                        "entities": [
+                            {
+                                "type": "MessageEntityType.CUSTOM_EMOJI",
+                                "offset": 7,
+                                "length": 2,
+                                "custom_emoji_id": 5373141891321699086,
+                            }
+                        ],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        import_archive_message_manifests(
+            self.json_chat_dir,
+            chat_id=self.chat.id,
+            is_channel=False,
+            archive_index=self.archive_index,
+        )
+
+        head = self.archive_index.get_head(self.chat.id, MESSAGE_ID)
+        assert head is not None
+        assert head.original.snapshot.entities[0].custom_emoji_id == "5373141891321699086"
+        stat = manifest_path.stat()
+        assert not self.archive_index.source_needs_scan(
+            manifest_path.absolute(),
+            size=stat.st_size,
+            modified_ns=stat.st_mtime_ns,
+        )
+
     def test_outbox_retry_deduplicates_file_written_before_acknowledgement(self) -> None:
         original = self.message("before")
         self.archive_index.index_original(MessageSnapshot.from_message(original))
