@@ -44,9 +44,13 @@ class BuildClientTests(unittest.TestCase):
         kwargs = self.build(continuous=False)
 
         assert kwargs["no_updates"] is True
+        assert kwargs["skip_updates"] is True
         assert kwargs["fetch_stickers"] is False
+        assert kwargs["workers"] == 1
 
     def test_enables_updates_for_continuous_backup(self) -> None:
         kwargs = self.build(continuous=True)
 
         assert kwargs["no_updates"] is False
+        assert kwargs["skip_updates"] is False
+        assert kwargs["workers"] == 1

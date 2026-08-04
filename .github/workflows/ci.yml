@@ -37,6 +37,9 @@ jobs:
       - name: Mypy
         run: uv run mypy tg_backup
 
+      - name: Unit tests
+        run: uv run python -m unittest discover -s tests -v
+
   docker:
     runs-on: ubuntu-latest
     needs: lint

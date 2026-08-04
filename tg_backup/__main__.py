@@ -5,13 +5,23 @@ import asyncio
 import importlib
 import logging
 import os
+from contextlib import suppress
 from pathlib import Path
 
-from pyrogram import Client, idle
-from pyrogram.handlers import MessageHandler
+from pyrogram import Client, idle, raw
+from pyrogram.handlers import EditedMessageHandler, MessageHandler, RawUpdateHandler
 from pyrogram.types import Message
 
-from tg_backup.backup import append_live_message, backup, log
+from tg_backup.backup import (
+    BackupSession,
+    append_deleted_update,
+    append_edited_message,
+    append_live_message,
+    backup,
+    download_indexed_media,
+    flush_archive_event_outbox,
+    log,
+)
 
 ENV_PREFIX = "TG_BACKUP_"
 
@@ -117,6 +127,11 @@ def build_client(*, takeout: bool, continuous: bool, workdir: Path) -> Client:
         # Kurigram from spawning background gap-recovery requests while the
         # exporter is already fetching the same history explicitly.
         no_updates=not continuous,
+        # Preserve queued edits/deletions across reconnects in continuous mode.
+        skip_updates=not continuous,
+        # Lifecycle updates must be applied in Telegram queue order. Multiple
+        # dispatcher workers can let an edit overtake its original message.
+        workers=1,
         # Sticker-set metadata is not needed by the export and otherwise adds
         # an RPC request while parsing every previously unseen sticker set.
         fetch_stickers=False,
@@ -128,7 +143,7 @@ def get_default_root(directory_name: str) -> Path:
     return Path.cwd() / directory_name
 
 
-async def run_app(args: argparse.Namespace) -> None:
+async def run_app(args: argparse.Namespace) -> None:  # noqa: PLR0912, PLR0915
     try:
         uvloop = importlib.import_module("uvloop")
     except ImportError:
@@ -148,8 +163,76 @@ async def run_app(args: argparse.Namespace) -> None:
     log.info("Launching client")
 
     client = build_client(takeout=args.takeout, continuous=args.continuous, workdir=state_output_dir)
+    session: BackupSession | None = None
+    state_lock = asyncio.Lock()
+    pending_updates: list[tuple[str, object]] = []
+    media_wakeup = asyncio.Event()
+    media_worker: asyncio.Task[None] | None = None
+
+    async def run_media_worker() -> None:
+        while True:
+            await media_wakeup.wait()
+            media_wakeup.clear()
+            active_session = session
+            if active_session is None or active_session.media_index is None:
+                continue
+            try:
+                await download_indexed_media(
+                    client,
+                    active_session.media_index,
+                    retry_failed=False,
+                    allowed_root=active_session.json_output_dir,
+                )
+            except Exception:
+                log.exception("Failed to drain the live media queue; pending items remain indexed.")
+
+    async def apply_update(kind: str, payload: object, handler_client: Client, active_session: BackupSession) -> None:
+        try:
+            if kind == "new" and isinstance(payload, Message):
+                await append_live_message(handler_client, payload, session=active_session)
+            elif kind == "edited" and isinstance(payload, Message):
+                append_edited_message(handler_client, payload, session=active_session)
+            elif kind == "deleted":
+                append_deleted_update(payload, session=active_session)
+        except Exception:
+            log.exception("Failed to preserve a live %s update; continuing.", kind)
+        else:
+            if active_session.download_attachments and active_session.media_index is not None:
+                media_wakeup.set()
+
+    async def dispatch_or_buffer(kind: str, payload: object, handler_client: Client) -> None:
+        async with state_lock:
+            if session is None:
+                pending_updates.append((kind, payload))
+                return
+            await apply_update(kind, payload, handler_client, session)
+
+    async def handle_message(handler_client: Client, message: Message) -> None:
+        await dispatch_or_buffer("new", message, handler_client)
+
+    async def handle_edited_message(handler_client: Client, message: Message) -> None:
+        await dispatch_or_buffer("edited", message, handler_client)
+
+    async def handle_raw_update(
+        handler_client: Client,
+        update: object,
+        users: object,
+        chats: object,
+    ) -> None:
+        del users, chats
+        if isinstance(update, raw.types.UpdateDeleteMessages | raw.types.UpdateDeleteChannelMessages):
+            await dispatch_or_buffer("deleted", update, handler_client)
+
+    if args.continuous:
+        client.add_handler(MessageHandler(handle_message))
+        # Kurigram runs at most one matching handler per group. Keep lifecycle
+        # handlers in separate groups so a generic MessageHandler cannot mask
+        # an edited-message callback.
+        client.add_handler(EditedMessageHandler(handle_edited_message), group=1)
+        client.add_handler(RawUpdateHandler(handle_raw_update), group=2)
+
     try:
-        session = await backup(
+        completed_session = await backup(
             client,
             state_output_dir=state_output_dir,
             json_output_dir=json_output_dir,
@@ -159,20 +242,43 @@ async def run_app(args: argparse.Namespace) -> None:
             download_attachments=download_attachments,
         )
         if not args.continuous:
+            session = completed_session
             return
 
-        state_lock = asyncio.Lock()
-
-        async def handle_message(handler_client: Client, message: Message) -> None:
-            async with state_lock:
-                await append_live_message(handler_client, message, session=session)
-
-        client.add_handler(MessageHandler(handle_message))
+        async with state_lock:
+            session = completed_session
+            media_worker = asyncio.create_task(run_media_worker(), name="tg-backup-media-worker")
+            for kind, payload in pending_updates:
+                await apply_update(kind, payload, client, session)
+            pending_updates.clear()
         log.info("Continuous mode enabled. Listening for new messages.")
         await idle()
     finally:
-        if client.is_connected:
-            await client.stop()
+        if media_worker is not None:
+            media_worker.cancel()
+            with suppress(asyncio.CancelledError):
+                await media_worker
+        try:
+            if client.is_connected:
+                # Stop and drain dispatcher callbacks while their indexes are
+                # still open, then close persistence below.
+                await client.stop()
+        finally:
+            if session is not None:
+                try:
+                    flush_archive_event_outbox(session)
+                except Exception:
+                    log.exception("Failed to flush the archive outbox during shutdown.")
+            if session is not None and session.media_index is not None:
+                try:
+                    session.media_index.close()
+                except Exception:
+                    log.exception("Failed to close the media index cleanly.")
+            if session is not None and session.archive_index is not None:
+                try:
+                    session.archive_index.close()
+                except Exception:
+                    log.exception("Failed to close the archive index cleanly.")
 
 
 def main() -> None:
