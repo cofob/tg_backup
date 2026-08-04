@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -148,6 +150,25 @@ class MessageSnapshotFactoryTests(unittest.TestCase):
         assert result.chat_id == 123
         assert result.is_channel is False
 
+    def test_marked_channel_id_overrides_stale_chat_type_metadata(self) -> None:
+        chat_id = -1002070662990
+        message = Message(
+            id=9,
+            chat=Chat(id=chat_id, type=ChatType.GROUP, title="Migrated supergroup"),
+            date=SENT_AT,
+            text="message",
+        )
+
+        from_message = MessageSnapshot.from_message(message)
+        from_export = MessageSnapshot.from_export_payload(
+            {"id": 9, "date": str(SENT_AT), "text": "message"},
+            chat_id=chat_id,
+            is_channel=False,
+        )
+
+        assert from_message.is_channel is True
+        assert from_export.is_channel is True
+
     def test_existing_json_export_normalizes_to_the_same_snapshot(self) -> None:
         entity = MessageEntity(type=MessageEntityType.BOLD, offset=0, length=5)
         photo = Photo(
@@ -281,6 +302,42 @@ class OriginalIndexTests(ArchiveIndexTestCase):
 
             assert second == first
             assert index.count_versions() == 1
+
+    def test_marked_channel_identity_is_normalized_before_indexing(self) -> None:
+        chat_id = -1002070662990
+        with ArchiveIndex(self.database_path) as index:
+            head = index.index_original(snapshot("channel", chat_id=chat_id, is_channel=False))
+
+        assert head.original.snapshot.is_channel is True
+
+    def test_v1_migration_repairs_channel_identity_and_retries_sources(self) -> None:
+        chat_id = -1002070662990
+        message_id = 72248
+        source_path = Path("json/chats/-1002070662990/2026-08-w1.messages.json")
+        with ArchiveIndex(self.database_path) as index:
+            index.index_original(snapshot("channel", chat_id=chat_id, message_id=message_id, is_channel=True))
+            index.mark_source_scanned(source_path, size=10, modified_ns=20)
+
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            connection.execute(
+                "UPDATE message_heads SET is_channel = 0 WHERE chat_id = ? AND message_id = ?",
+                (chat_id, message_id),
+            )
+            connection.execute("PRAGMA user_version = 1")
+            connection.commit()
+
+        with ArchiveIndex(self.database_path) as migrated:
+            channel_head = migrated.get_head(chat_id, message_id)
+            assert channel_head is not None
+            assert channel_head.original.snapshot.is_channel is True
+            assert migrated.source_needs_scan(source_path, size=10, modified_ns=20)
+
+            migrated.index_original(snapshot("private", chat_id=1457408124, message_id=message_id, is_channel=False))
+            assert migrated.count_messages() == 2
+
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            version_row = connection.execute("PRAGMA user_version").fetchone()
+        assert version_row == (2,)
 
     def test_channel_ids_may_repeat_but_non_channel_ids_are_unambiguous(self) -> None:
         with ArchiveIndex(self.database_path) as index:

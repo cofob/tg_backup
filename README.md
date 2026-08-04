@@ -188,6 +188,7 @@ Media is downloaded to a unique staging path and moved into place only after siz
 
 - `state/state.json` stores the chat list, progress fields (`history_complete`, `oldest_message_id`, and `latest_message_id`), and failure diagnostics (`failure_count`, `last_error`, and `last_error_at`). Successful syncs clear the current error without resetting the cumulative failure count.
 - `state/archive-index.sqlite3` stores immutable first-observed/current message versions, deletion tombstones, lifecycle events, and a per-output-format delivery outbox. SQLite uses WAL mode with full synchronous commits.
+- Archive-index migrations derive the channel namespace from Telegram's marked `-100…` peer ids when older chat metadata is stale, then safely rescan legacy manifests to recover records skipped by earlier classification conflicts.
 - `state/media-index.sqlite3` stores stable media identity, the latest downloadable file id, target path, expected size, status, attempt count, and last error. SQLite uses WAL mode with full synchronous commits.
 - `state.json`, chat/topic mappings, chat metadata, JSON export repairs, and lifecycle event files use same-directory temporary files plus atomic replacement. Existing file permissions are preserved.
 - Pyrogram session files are stored in `TG_BACKUP_STATE_ROOT` because the client `workdir` is set to that directory.

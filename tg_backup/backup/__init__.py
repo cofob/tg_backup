@@ -983,24 +983,28 @@ def index_original_messages(messages: Iterable[Message], *, archive_index: Archi
     index_archive_snapshots(snapshots, archive_index=archive_index)
 
 
-def index_archive_snapshots(snapshots: list[MessageSnapshot], *, archive_index: ArchiveIndex) -> None:
+def index_archive_snapshots(snapshots: list[MessageSnapshot], *, archive_index: ArchiveIndex) -> bool:
     if not snapshots:
-        return
+        return True
     try:
         archive_index.index_originals(snapshots)
     except ValueError:
         # A malformed or conflicting legacy record must not block valid records
         # from the same export file.
+        indexed_all = True
         for snapshot in snapshots:
             try:
                 archive_index.index_original(snapshot)
             except (TypeError, ValueError) as error:
+                indexed_all = False
                 log.warning(
                     "Cannot import archive message %s/%s: %s",
                     snapshot.chat_id,
                     snapshot.message_id,
                     error,
                 )
+        return indexed_all
+    return True
 
 
 def import_archive_message_manifests(
@@ -1043,8 +1047,8 @@ def import_archive_message_manifests(
                 had_errors = True
                 log.warning("Cannot import message entry from %s: %s", manifest_path, error)
 
-        index_archive_snapshots(snapshots, archive_index=archive_index)
-        if not had_errors:
+        indexed_all = index_archive_snapshots(snapshots, archive_index=archive_index)
+        if not had_errors and indexed_all:
             archive_index.mark_source_scanned(source_path, size=stat.st_size, modified_ns=stat.st_mtime_ns)
 
 

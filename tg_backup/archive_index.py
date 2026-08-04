@@ -17,6 +17,19 @@ from typing import Self
 from pyrogram.enums import ChatType
 from pyrogram.types import Message, MessageEntity
 
+TELEGRAM_CHANNEL_CHAT_ID_CUTOFF = -1_000_000_000_000
+
+
+def is_channel_chat_id(chat_id: int) -> bool:
+    """Return whether a marked Telegram peer id belongs to a channel namespace.
+
+    Telegram represents channels and supergroups as ``-100<channel_id>`` in
+    high-level clients. Unlike private chats and basic groups, their message ids
+    are scoped to the channel instead of the account-wide non-channel box.
+    """
+
+    return chat_id <= TELEGRAM_CHANNEL_CHAT_ID_CUTOFF
+
 
 class ArchiveEventKind(StrEnum):
     """Kinds of immutable message lifecycle events retained by the archive."""
@@ -116,6 +129,7 @@ class MessageSnapshot:
             if message_chat is None or message_chat.type is None:
                 raise ValueError("A message snapshot requires is_channel when chat type is unavailable.")
             is_channel = message_chat.type in {ChatType.CHANNEL, ChatType.SUPERGROUP}
+        is_channel = is_channel or is_channel_chat_id(resolved_chat_id)
 
         thread_id = message.reply_to_top_message_id
         if thread_id is None:
@@ -165,7 +179,7 @@ class MessageSnapshot:
         return cls(
             chat_id=chat_id,
             message_id=message_id,
-            is_channel=is_channel,
+            is_channel=is_channel or is_channel_chat_id(chat_id),
             sent_at=_export_datetime(payload.get("date")),
             thread_id=thread_id,
             edit_date=_export_datetime(payload.get("edit_date")),
@@ -287,7 +301,8 @@ class ArchiveIndex:
     and head mutation happen in one SQLite transaction.
     """
 
-    _SCHEMA_VERSION = 1
+    _SCHEMA_VERSION = 2
+    _CHANNEL_ID_SCHEMA_VERSION = 2
 
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
@@ -340,15 +355,16 @@ class ArchiveIndex:
         observation_time = _utc_datetime(observed_at)
         with self._transaction():
             for snapshot in snapshots:
-                self._validate_snapshot(snapshot)
-                existing = self._head_row(snapshot.chat_id, snapshot.message_id)
+                normalized_snapshot = _normalize_channel_identity(snapshot)
+                self._validate_snapshot(normalized_snapshot)
+                existing = self._head_row(normalized_snapshot.chat_id, normalized_snapshot.message_id)
                 if existing is not None:
-                    if bool(existing["is_channel"]) != snapshot.is_channel:
+                    if bool(existing["is_channel"]) != normalized_snapshot.is_channel:
                         raise ValueError("An indexed message cannot change between channel and non-channel identity.")
                     continue
-                self._ensure_non_channel_id_available(snapshot)
-                content_hash = stable_content_hash(snapshot)
-                self._insert_version(snapshot, content_hash=content_hash, observed_at=observation_time)
+                self._ensure_non_channel_id_available(normalized_snapshot)
+                content_hash = stable_content_hash(normalized_snapshot)
+                self._insert_version(normalized_snapshot, content_hash=content_hash, observed_at=observation_time)
                 self._connection.execute(
                     """
                     INSERT INTO message_heads (
@@ -357,12 +373,12 @@ class ArchiveIndex:
                     ) VALUES (?, ?, ?, ?, ?, ?, NULL)
                     """,
                     (
-                        snapshot.chat_id,
-                        snapshot.message_id,
-                        int(snapshot.is_channel),
+                        normalized_snapshot.chat_id,
+                        normalized_snapshot.message_id,
+                        int(normalized_snapshot.is_channel),
                         content_hash,
                         content_hash,
-                        _datetime_value(snapshot.edit_date),
+                        _datetime_value(normalized_snapshot.edit_date),
                     ),
                 )
 
@@ -403,6 +419,7 @@ class ArchiveIndex:
         duplicate/current or observably stale snapshot also produces no event.
         """
 
+        snapshot = _normalize_channel_identity(snapshot)
         self._validate_snapshot(snapshot)
         observation_time = _utc_datetime(observed_at)
         event_id: str | None = None
@@ -752,6 +769,7 @@ class ArchiveIndex:
             raise RuntimeError(
                 f"Archive index schema {current_version} is newer than supported version {self._SCHEMA_VERSION}."
             )
+        needs_v2_migration = current_version < self._CHANNEL_ID_SCHEMA_VERSION
 
         with self._transaction():
             self._connection.execute(
@@ -792,6 +810,15 @@ class ArchiveIndex:
                 ) WITHOUT ROWID
                 """
             )
+            if needs_v2_migration:
+                # Schema v1 trusted stale chat-type metadata during legacy
+                # bootstrap. Correct every unambiguous marked channel id and
+                # force one idempotent rescan so records skipped by the former
+                # non-channel uniqueness conflict are recovered.
+                self._connection.execute(
+                    "UPDATE message_heads SET is_channel = 1 WHERE chat_id <= ? AND is_channel = 0",
+                    (TELEGRAM_CHANNEL_CHAT_ID_CUTOFF,),
+                )
             self._connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS message_heads_non_channel_id_idx
@@ -850,6 +877,8 @@ class ArchiveIndex:
                 ) WITHOUT ROWID
                 """
             )
+            if needs_v2_migration:
+                self._connection.execute("DELETE FROM archive_sources")
             self._connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS unresolved_deletion_events (
@@ -1394,6 +1423,12 @@ def _required_datetime(value: str) -> datetime:
 
 def _is_observably_stale(previous: datetime | None, current: datetime | None) -> bool:
     return previous is not None and current is not None and current < previous
+
+
+def _normalize_channel_identity(snapshot: MessageSnapshot) -> MessageSnapshot:
+    if snapshot.is_channel or not is_channel_chat_id(snapshot.chat_id):
+        return snapshot
+    return replace(snapshot, is_channel=True)
 
 
 def _first_non_null(mapping: Mapping[object, object], *names: str) -> object:

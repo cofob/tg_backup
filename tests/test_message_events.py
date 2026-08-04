@@ -222,6 +222,35 @@ class MessageEventTests(unittest.TestCase):
             modified_ns=stat.st_mtime_ns,
         )
 
+    def test_index_conflict_does_not_mark_manifest_as_scanned(self) -> None:
+        self.archive_index.index_original(
+            MessageSnapshot.from_export_payload(
+                {"id": MESSAGE_ID, "date": str(self.sent_at), "text": "another private chat"},
+                chat_id=999,
+                is_channel=False,
+            )
+        )
+        self.json_chat_dir.mkdir(parents=True)
+        manifest_path = self.json_chat_dir / "2026-08-w1.messages.json"
+        manifest_path.write_text(
+            json.dumps([{"id": MESSAGE_ID, "date": str(self.sent_at), "text": "conflicting private chat"}]),
+            encoding="utf-8",
+        )
+
+        import_archive_message_manifests(
+            self.json_chat_dir,
+            chat_id=self.chat.id,
+            is_channel=False,
+            archive_index=self.archive_index,
+        )
+
+        stat = manifest_path.stat()
+        assert self.archive_index.source_needs_scan(
+            manifest_path.absolute(),
+            size=stat.st_size,
+            modified_ns=stat.st_mtime_ns,
+        )
+
     def test_outbox_retry_deduplicates_file_written_before_acknowledgement(self) -> None:
         original = self.message("before")
         self.archive_index.index_original(MessageSnapshot.from_message(original))
