@@ -148,15 +148,24 @@ def human_readable(n: float, unit: str, *, precision: int = 2) -> str:
 
 
 def get_chat_brief(chat: Chat) -> ChatBrief:
+    if chat.id is None or chat.type is None:
+        raise ValueError("Telegram returned a chat without an id or type.")
+
     if chat.type is ChatType.BOT:
-        qualname = chat.first_name
+        qualname = chat.first_name or "unknown"
     elif chat.type is ChatType.PRIVATE:
-        qualname = f"{chat.first_name} {chat.last_name}" if chat.last_name else chat.first_name
+        qualname = f"{chat.first_name} {chat.last_name}" if chat.last_name else (chat.first_name or "unknown")
     elif chat.type in {ChatType.CHANNEL, ChatType.GROUP, ChatType.SUPERGROUP}:
-        qualname = chat.title
+        qualname = chat.title or "unknown"
     else:
         qualname = "unknown"
     return ChatBrief(type=chat.type, username=chat.username, qualname=qualname, id=chat.id)
+
+
+def get_chat_id(chat: Chat) -> int:
+    if chat.id is None:
+        raise ValueError("Telegram returned a chat without an id.")
+    return chat.id
 
 
 async def backup(
@@ -276,14 +285,14 @@ def validate_backup_config(
 
 async def get_or_refresh_backup_state(client: Client, state_file: Path) -> tuple[BackupState, dict[int, Chat]]:
     chats = await get_chats_info(client=client)
-    chats_by_id = {chat.id: chat for chat in chats}
+    chats_by_id = {get_chat_id(chat): chat for chat in chats}
     existing_state = load_backup_state(state_file)
     existing_by_id = {chat.id: chat for chat in existing_state.chats}
 
     merged_states: list[ChatExportState] = []
     for chat in chats:
         brief = get_chat_brief(chat)
-        current = existing_by_id.get(chat.id)
+        current = existing_by_id.get(brief.id)
         if current is None:
             merged_states.append(
                 ChatExportState(
@@ -494,11 +503,12 @@ async def refresh_forum_topics(
         return
     if chat.type is not ChatType.SUPERGROUP:
         return
-    if not await is_forum_chat(client, chat.id):
+    chat_id = get_chat_id(chat)
+    if not await is_forum_chat(client, chat_id):
         return
 
     try:
-        topics = await get_forum_topics(client, chat.id, topic_ids=topic_ids)
+        topics = await get_forum_topics(client, chat_id, topic_ids=topic_ids)
     except (RPCError, TypeError):
         return
 
@@ -525,14 +535,13 @@ async def get_forum_topics(
     topic_ids: Sequence[int] | None = None,
 ) -> list[ForumTopicEntry]:
     peer = await client.resolve_peer(chat_id)
-    channel = get_input_channel(peer)
-    if channel is None:
+    if peer is None:
         return []
 
     if topic_ids is not None:
         response = await client.invoke(
-            raw.functions.channels.GetForumTopicsByID(
-                channel=channel,
+            raw.functions.messages.GetForumTopicsByID(
+                peer=peer,
                 topics=list(topic_ids),
             )
         )
@@ -545,8 +554,8 @@ async def get_forum_topics(
 
     while True:
         response = await client.invoke(
-            raw.functions.channels.GetForumTopics(
-                channel=channel,
+            raw.functions.messages.GetForumTopics(
+                peer=peer,
                 offset_date=offset_date,
                 offset_id=offset_id,
                 offset_topic=offset_topic,
@@ -625,7 +634,7 @@ async def append_chat_history(  # noqa: PLR0913
     export_text: bool,
 ) -> None:
     offset_id = chat_state.oldest_message_id or 0
-    async for messages_batch in get_chat_messages(client=client, chat_id=chat.id, offset_id=offset_id):
+    async for messages_batch in get_chat_messages(client=client, chat_id=get_chat_id(chat), offset_id=offset_id):
         if not messages_batch:
             continue
         append_export_batch(
@@ -661,7 +670,7 @@ async def append_recent_messages(  # noqa: PLR0913
 
     latest_known_id = chat_state.latest_message_id
     pending_messages: list[Message] = []
-    async for messages_batch in get_chat_messages(client=client, chat_id=chat.id):
+    async for messages_batch in get_chat_messages(client=client, chat_id=get_chat_id(chat)):
         if not messages_batch:
             continue
 
@@ -687,8 +696,14 @@ async def append_recent_messages(  # noqa: PLR0913
     persist_state()
 
 
-async def append_live_message(client: Client, message: Message, *, session: BackupSession) -> None:
+async def append_live_message(  # noqa: PLR0912
+    client: Client, message: Message, *, session: BackupSession
+) -> None:
     chat = message.chat
+    if chat is None:
+        log.warning("Skipping live message %s because Telegram did not include its chat.", message.id)
+        return
+
     chat_state = ensure_chat_state(session.state, chat)
     if chat_state.latest_message_id is not None and message.id <= chat_state.latest_message_id:
         return
@@ -956,14 +971,15 @@ def get_corrupt_export_backup_path(path: Path) -> Path:
 
 
 async def dump_chat_json_metadata(client: Client, chat: Chat, *, json_chat_dir: Path) -> None:
-    chat_info = await client.get_chat(chat_id=chat.id)
+    chat_id = get_chat_id(chat)
+    chat_info = await client.get_chat(chat_id=chat_id)
     chat_info_json = json_chat_dir / "info.json"
     log.info("Dump chat info (%s).", chat_info_json)
     with chat_info_json.open("w", encoding=DEFAULT_ENCODING) as fp:
         json.dump(chat_info, fp, indent=DEFAULT_JSON_INDENT, default=Object.default, ensure_ascii=False)
 
     log.info("Get chat avatars info.")
-    avatars = await get_chat_avatars(client, chat.id)
+    avatars = await get_chat_avatars(client, chat_id)
     avatars_json = json_chat_dir / "avatars.json"
     log.info("Dump chat avatars info (%s).", avatars_json)
     with avatars_json.open("w", encoding=DEFAULT_ENCODING) as fp:
@@ -1004,7 +1020,7 @@ def get_message_event_text(message: Message) -> str | None:
         event_text = f"added to chat: {names}"
     elif message.left_chat_member is not None:
         event_text = f"left chat: {get_display_name(message.left_chat_member)}"
-    elif message.new_chat_title:  # type: ignore[unreachable]
+    elif message.new_chat_title:
         event_text = f"changed chat title to: {message.new_chat_title}"
     elif message.delete_chat_photo:
         event_text = "removed the chat photo"
@@ -1029,7 +1045,7 @@ def get_display_name(user: User) -> str:
 def get_message_author_label(message: Message) -> str:
     if message.from_user is not None:
         return get_display_name(message.from_user)
-    if message.sender_chat is not None:  # type: ignore[unreachable]
+    if message.sender_chat is not None:
         if message.sender_chat.title:
             return message.sender_chat.title
         if message.sender_chat.username:
@@ -1197,7 +1213,7 @@ def get_media_file_info(client: Client, media: TGMedia) -> MediaFileInfo | None:
 
 async def get_chats_info(client: Client) -> list[Chat]:
     log.info("Start grabbbing chats info.")
-    dialogs_iter: AsyncIterator[Dialog] = client.get_dialogs()  # type: ignore[assignment]
+    dialogs_iter: AsyncIterator[Dialog] = client.get_dialogs()
     dialogs: list[Dialog | None] = []
     async for counter, dialogs_batch in batch_asynciter(dialogs_iter):
         dialogs.extend(dialogs_batch)
@@ -1208,7 +1224,8 @@ async def get_chats_info(client: Client) -> list[Chat]:
 
     chats_by_type: dict[ChatType, list[Chat]] = {chat_type: [] for chat_type in ChatType}
     for chat in chats:
-        chats_by_type[chat.type].append(chat)
+        if chat.type is not None:
+            chats_by_type[chat.type].append(chat)
 
     log.info(
         "Collected chats info stats:\n%s",
@@ -1217,7 +1234,7 @@ async def get_chats_info(client: Client) -> list[Chat]:
     return chats
 
 
-async def get_chat_avatars(client: Client, chat_id: int) -> list[Photo] | None:
+async def get_chat_avatars(client: Client, chat_id: int) -> list[Photo | Animation] | None:
     retry = True
     while retry:
         retry = False
@@ -1242,7 +1259,7 @@ async def get_chat_messages(
     offset_id: int = 0,
 ) -> AsyncIterator[list[Message]]:
     log.info("Start grabbbing messages of chat %s.", chat_id)
-    messages_iter: AsyncIterator[Message] = client.get_chat_history(chat_id=chat_id, offset_id=offset_id)  # type: ignore[assignment]
+    messages_iter: AsyncIterator[Message] = client.get_chat_history(chat_id=chat_id, offset_id=offset_id)
     count = 0
     async for counter, messages_batch in batch_asynciter(messages_iter, batch_size=batch_size):
         clean_batch = [message for message in messages_batch if message is not None]

@@ -1,6 +1,6 @@
 # tg_backup
 
-`tg_backup` exports Telegram chat history with [Pyrogram](https://docs.pyrogram.org/). It writes persistent JSON and TXT exports, keeps per-chat progress in `state.json`, and can continue listening for new messages after the initial sync.
+`tg_backup` exports Telegram chat history with [Kurigram](https://docs.kurigram.icu/), the maintained drop-in successor to Pyrogram. It writes persistent JSON and TXT exports, keeps per-chat progress in `state.json`, and can continue listening for new messages after the initial sync.
 
 ## Features
 
@@ -21,9 +21,9 @@
 
 Dependencies and the `tg-backup` console script are declared in [pyproject.toml](/Users/cofob/Development/tg_backup/pyproject.toml).
 
-Pyrogram speedups applied in this repo:
+Kurigram speedups applied in this repo:
 
-- `TgCrypto` is installed as a project dependency and is picked up automatically by Pyrogram.
+- `TgCrypto` is installed as a project dependency and is picked up automatically by Kurigram.
 - `uvloop` is installed on Linux and activated before any `pyrogram.Client` instance is created.
 
 ## Installation
@@ -162,6 +162,8 @@ On later runs:
 - chats with unfinished history resume from their last known `oldest_message_id`
 - chats with completed history fetch only newer messages after `latest_message_id`
 - mapping files and state are refreshed as chat metadata changes
+
+Incoming Telegram updates are disabled for one-shot backups because history is fetched explicitly. This avoids unnecessary background update-recovery requests and makes reconnects much quieter. `--continuous` keeps incoming updates enabled.
 
 With `--continuous`, after the sync phase the process stays connected, listens for new messages on all chats, appends them immediately, updates `state.json`, and downloads new attachments when enabled.
 

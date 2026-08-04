@@ -16,9 +16,20 @@ from tg_backup.backup import append_live_message, backup, log
 ENV_PREFIX = "TG_BACKUP_"
 
 
+class BackupClient(Client):
+    async def handle_updates(self, updates: object) -> None:
+        try:
+            await super().handle_updates(updates)  # type: ignore[no-untyped-call]
+        except (OSError, TimeoutError) as error:
+            # Kurigram schedules this internal coroutine as a background task.
+            # A reconnect can invalidate its gap-recovery RPC, but the session
+            # itself will restart and recover subsequent updates.
+            log.warning("Telegram update recovery was interrupted by a connection reset: %s", error)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--takeout", action="store_true", help="Use a Pyrogram takeout session for export runs.")
+    parser.add_argument("--takeout", action="store_true", help="Use a Kurigram takeout session for export runs.")
     parser.add_argument("--continuous", action="store_true", help="Keep listening and append new messages after sync.")
     return parser.parse_args()
 
@@ -43,7 +54,7 @@ def configure_logging(state_output_dir: Path) -> None:
     log_handler.setFormatter(log_formatter)
     log.addHandler(log_handler)
 
-    # Pyrogram writes unknown RPC errors to ./unknown_errors.txt.
+    # Kurigram writes unknown RPC errors to ./unknown_errors.txt.
     # Use the writable state directory so containerized runs do not fail on /app.
     os.chdir(state_output_dir)
 
@@ -95,13 +106,20 @@ def get_path_env(name: str, *, default: Path) -> Path:
     return Path(value).expanduser()
 
 
-def build_client(*, takeout: bool, workdir: Path) -> Client:
-    return Client(
+def build_client(*, takeout: bool, continuous: bool, workdir: Path) -> Client:
+    return BackupClient(
         name=get_str_env("APP_NAME"),
         api_id=get_int_env("API_ID"),
         api_hash=get_str_env("API_HASH"),
         phone_number=get_str_env("PHONE"),
         takeout=takeout,
+        # A regular backup does not consume live updates. Disabling them keeps
+        # Kurigram from spawning background gap-recovery requests while the
+        # exporter is already fetching the same history explicitly.
+        no_updates=not continuous,
+        # Sticker-set metadata is not needed by the export and otherwise adds
+        # an RPC request while parsing every previously unseen sticker set.
+        fetch_stickers=False,
         workdir=str(workdir),
     )
 
@@ -129,7 +147,7 @@ async def run_app(args: argparse.Namespace) -> None:
     configure_logging(state_output_dir)
     log.info("Launching client")
 
-    client = build_client(takeout=args.takeout, workdir=state_output_dir)
+    client = build_client(takeout=args.takeout, continuous=args.continuous, workdir=state_output_dir)
     try:
         session = await backup(
             client,

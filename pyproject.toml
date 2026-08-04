@@ -1,13 +1,13 @@
 [project]
 name = "tg-backup"
 version = "0.1.0"
-description = "Telegram chat and media export utility built on Pyrogram."
+description = "Telegram chat and media export utility built on Kurigram."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "adaptix==3.0.0b8",
     "json-stream==2.3.2",
-    "pyrogram==2.0.106",
+    "kurigram==2.2.24",
     "tgcrypto",
     "uvloop; sys_platform == 'linux'",
 ]
