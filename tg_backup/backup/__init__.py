@@ -633,8 +633,13 @@ async def append_chat_history(  # noqa: PLR0913
     export_json: bool,
     export_text: bool,
 ) -> None:
-    offset_id = chat_state.oldest_message_id or 0
-    async for messages_batch in get_chat_messages(client=client, chat_id=get_chat_id(chat), offset_id=offset_id):
+    if chat_state.oldest_message_id is not None and chat_state.oldest_message_id <= 1:
+        chat_state.history_complete = True
+        persist_state()
+        return
+
+    max_id = chat_state.oldest_message_id - 1 if chat_state.oldest_message_id is not None else 0
+    async for messages_batch in get_chat_messages(client=client, chat_id=get_chat_id(chat), max_id=max_id):
         if not messages_batch:
             continue
         append_export_batch(
@@ -1256,10 +1261,10 @@ async def get_chat_messages(
     chat_id: int,
     *,
     batch_size: int = 1000,
-    offset_id: int = 0,
+    max_id: int = 0,
 ) -> AsyncIterator[list[Message]]:
     log.info("Start grabbbing messages of chat %s.", chat_id)
-    messages_iter: AsyncIterator[Message] = client.get_chat_history(chat_id=chat_id, offset_id=offset_id)
+    messages_iter: AsyncIterator[Message] = client.get_chat_history(chat_id=chat_id, max_id=max_id)
     count = 0
     async for counter, messages_batch in batch_asynciter(messages_iter, batch_size=batch_size):
         clean_batch = [message for message in messages_batch if message is not None]
