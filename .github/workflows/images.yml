@@ -47,7 +47,9 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ github.ref_name }}
           provenance: false
-          cache-from: type=gha,scope=${{ matrix.arch }}-core
+          cache-from: |
+            type=gha,scope=${{ matrix.arch }}-core
+            type=gha,scope=${{ matrix.arch }}-ffmpeg
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}-core
       - name: Save core digest
         env:
