@@ -1,0 +1,64 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  validate-tag:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Match tag to package version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PYCODE'
+          import os, tomllib
+          with open("Cargo.toml", "rb") as f:
+              version = tomllib.load(f)["package"]["version"]
+          assert os.environ["TAG_NAME"] == f"v{version}", "tag/package version mismatch"
+          PYCODE
+  checks:
+    needs: validate-tag
+    uses: $/.github/workflows/ci.yml
+  images:
+    needs: checks
+    permissions:
+      contents: read
+      packages: write
+    uses: $/.github/workflows/images.yml
+  publish:
+    needs: [checks, images]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: tg-backup-client-*
+          path: assets
+          merge-multiple: true
+      - name: Check assets and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          cd assets
+          sha256sum --check ./*.sha256
+          test "$(find . -name '*.tar.gz' | wc -l)" -eq 2
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" --clobber ./*.tar.gz ./*.sha256
+          else
+            gh release create "$TAG_NAME" --verify-tag --draft --title "$TAG_NAME" --notes-file ../RELEASE_NOTES.md ./*.tar.gz ./*.sha256
+          fi
+          gh release edit "$TAG_NAME" --draft=false

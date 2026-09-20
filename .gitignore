@@ -170,3 +170,10 @@ cython_debug/
 *.session
 *.session-journal
 TelegramExports
+
+# Rust and v2 datasets
+/target/
+/dataset/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm

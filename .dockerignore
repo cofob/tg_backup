@@ -19,3 +19,8 @@ json
 txt
 local
 TelegramExports
+
+target
+dataset
+*.sqlite3*
+tests
