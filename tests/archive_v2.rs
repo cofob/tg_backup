@@ -677,7 +677,21 @@ fn synthetic_archive_storage_report() {
         .len(),
         1
     );
-    println!("{}", a.status().unwrap());
+    let report = a.storage_details().unwrap();
+    let epochs = report["epochs"].as_object().unwrap();
+    let compressed: u64 = epochs
+        .values()
+        .map(|epoch| {
+            epoch["compressed_payload_bytes"].as_u64().unwrap()
+                + epoch["dictionary_bytes"].as_u64().unwrap()
+        })
+        .sum();
+    let raw: u64 = epochs
+        .values()
+        .map(|epoch| epoch["uncompressed_payload_bytes"].as_u64().unwrap())
+        .sum();
+    assert!(compressed < raw);
+    println!("{report}");
 }
 
 #[test]

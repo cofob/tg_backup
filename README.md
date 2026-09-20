@@ -207,7 +207,7 @@ TG_BACKUP_SMOKE_DATASET=./smoke-dataset cargo test --test live_telegram -- --ign
 cargo test --test archive_v2 synthetic_archive_storage_report -- --ignored --nocapture
 ```
 
-`status --details` reports compressed payloads, dictionaries, deduplicated media bytes, and SQLite page usage by table/index. The 10,000-message synthetic fixture measured 6,876,000 raw TL bytes compressed to 51,319 bytes, with a 7,487,488-byte catalog and 4,481,024-byte epoch database. These are synthetic figures, not expected ratios for real accounts; metadata/index overhead is currently much larger than compressed payloads. Archive scans and compression use bounded batches. Grammers currently uses an unbounded live update queue to avoid dropping updates; sustained ingestion lag can grow memory, so that transport path still needs production load validation.
+`status --details` reports compressed payloads, dictionaries, deduplicated media bytes, and SQLite page usage by table/index. The 10,000-message synthetic fixture measured 6,876,000 raw TL bytes compressed to 51,319 bytes, with a 7,520,256-byte catalog and 4,481,024-byte epoch database. These are synthetic figures, not expected ratios for real accounts; metadata/index overhead is currently much larger than compressed payloads. Archive scans and compression use bounded batches. Grammers currently uses an unbounded live update queue to avoid dropping updates; sustained ingestion lag can grow memory, so that transport path still needs production load validation.
 
 The Docker image contains both Rust binaries and runs as an unprivileged user. Mount a writable dataset directory at `/data`. GitHub Actions checks Linux/macOS and retains the repository's container publishing workflow.
 

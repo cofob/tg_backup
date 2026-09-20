@@ -53,6 +53,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y ffmpeg
           cargo +1.98.1 test --locked --test operations real_webp_transcode -- --ignored
+      - name: Measure synthetic archive storage and peak memory
+        if: runner.os == 'Linux'
+        run: /usr/bin/time -v cargo +1.98.1 test --locked --workspace --test archive_v2 synthetic_archive_storage_report -- --ignored --nocapture
       - run: cargo +1.98.1 build --locked --workspace --release --bins
       - name: Enforce client dependency isolation
         run: ci/client-isolation.sh
