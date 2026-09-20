@@ -2,7 +2,7 @@
 
 A Rust Telegram cloud archive. Native Telegram TL payloads are stored in zstd-compressed blocks inside **separate SQLite databases for each epoch**. Attachments are stored as deduplicated files. The archive retains observed object versions, observations, presence/read-state changes, and authoritative deletion events.
 
-V2 starts a new dataset. It does not import v1 backups or reuse Python/Kurigram sessions. V1 is available in Git history.
+V2 starts a new archive dataset and does not import v1 backup data. A standalone migration script can reuse a v1 Python/Kurigram authorization session. V1 is available in Git history.
 
 ## Build and start
 
@@ -22,6 +22,21 @@ tg-backup --dataset ./dataset sync --takeout
 ```
 
 Obtain API credentials from [my.telegram.org](https://my.telegram.org/). Login prompts for the Telegram code and, if required, a 2FA password. Password entry is masked; `TG_BACKUP_PASSWORD` is also accepted. Authentication/session secrets are stored in `session.sqlite3`, separately from queryable archive data.
+
+### Migrate a v1 session
+
+The dependency-free Python 3.11+ migrator transfers the Telegram authorization key and compatible peer cache from a v1 Kurigram/Pyrogram session. It does not migrate archived messages or files. Initialize an empty v2 dataset, run the migrator, then provide the API hash that belonged to the v1 application:
+
+```sh
+tg-backup --dataset ./dataset setup --non-interactive --skip-login
+python3 scripts/migrate_v1_session.py \
+  --source ./state/tg_backup.session \
+  --dataset ./dataset
+export TG_BACKUP_API_HASH=your_api_hash
+tg-backup --dataset ./dataset sync
+```
+
+The API hash is not present in a v1 session, so a newly created `auth.toml` references `TG_BACKUP_API_HASH`. Use `--api-hash-env NAME` to choose another variable. Existing `auth.toml` files are preserved when their API ID matches. The script reads the source database in read-only mode, never deletes it, refuses to overwrite a v2 session, and publishes the new session atomically with mode 0600. Telegram test-datacenter sessions are rejected because this v2 build uses production datacenters. V1 did not persist update counters, so v2 obtains a fresh update state on its first connection.
 
 ```sh
 tg-backup sync --continuous

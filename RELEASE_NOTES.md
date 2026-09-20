@@ -2,8 +2,9 @@
 
 Rust rewrite with native Telegram TL storage, a durable ingestion journal, separate
 SQLite epoch files, zstd blocks, retained object occurrences, and content-addressed
-attachments. V2 creates a new dataset; v1 data and authentication sessions are not
-migrated.
+attachments. V2 creates a new dataset; v1 archive data is not migrated. The
+standard-library-only `scripts/migrate_v1_session.py` tool can migrate a v1
+Kurigram/Pyrogram authorization session and peer cache into an empty v2 dataset.
 
 - Monthly/weekly/yearly epochs and a default 4 GiB size rollover target.
 - Resumable and continuous collection, independent history/media selectors,
