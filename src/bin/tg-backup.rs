@@ -23,6 +23,8 @@ struct Cli {
 enum Command {
     /// Interactively explore and export the archive (read-only).
     Tui,
+    /// Export an offline interactive social graph (read-only).
+    Graph(tg_backup::graph::Options),
     Init {
         #[arg(long, value_enum, default_value = "monthly")]
         epoch: EpochPeriod,
@@ -125,6 +127,7 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     match cli.command {
+        Command::Graph(options) => tg_backup::graph::run(&cli.dataset, &options)?,
         Command::Tui => {
             tg_backup_tui::run(std::sync::Arc::new(tg_backup::explorer::LocalBackend {
                 root: cli.dataset,

@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Telegram social graph</title>
+<link rel="icon" href="data:,">
+<style>
+:root{color-scheme:dark;font:15px system-ui;background:#101724;color:#e5edf7}*{box-sizing:border-box}body{margin:0}header{padding:16px 22px;border-bottom:1px solid #344057}h1{font-size:21px;margin:0 0 8px}p{line-height:1.5}button,input{font:inherit;color:inherit;background:#202d42;border:1px solid #52617a;border-radius:5px;padding:7px}button{cursor:pointer}button:hover{background:#35465f}button:focus-visible,input:focus-visible{outline:2px solid #80caff}.toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:10px 0}#types label{white-space:nowrap}main{display:grid;grid-template-columns:minmax(0,1fr) 340px;height:calc(100vh - 265px);min-height:450px}#stage{position:relative;overflow:hidden}canvas{width:100%;height:100%;touch-action:none}aside{overflow:auto;border-left:1px solid #344057;padding:16px}#neighbors,#results{list-style:none;padding:0}li{margin:6px 0}li button{width:100%;text-align:left}small,.muted{color:#acbbce}#status{min-height:24px}#error{color:#ffb4aa}#legend{position:absolute;bottom:12px;left:16px;pointer-events:none;background:#101724dd;padding:8px}#details{white-space:pre-wrap;overflow-wrap:anywhere}#more{width:100%}@media(max-width:750px){main{display:flex;flex-direction:column;height:auto}#stage{height:60vh}aside{border-left:0;border-top:1px solid #344057}header{padding:12px}}
+</style>
+<header><h1>Telegram social graph</h1><div id="period" class="muted"></div>
+<div class="toolbar"><label>From <input type="date" id="from"></label><label>To <input type="date" id="to"></label><button id="apply">Apply dates</button><button id="reset">Reset to exported view</button></div>
+<div id="types" class="toolbar"></div><div class="toolbar"><button id="expand">Expand selected</button><button id="collapse">Collapse to selected</button><button id="home">Focus original person</button><button id="zoomIn" aria-label="Zoom in">+</button><button id="zoomOut" aria-label="Zoom out">−</button></div>
+<div id="error" role="alert"></div><div id="status" role="status"></div></header>
+<main><div id="stage"><canvas id="canvas" aria-label="Social graph; use the searchable neighbor list for keyboard navigation"></canvas><div id="legend">● User &nbsp; ● Bot (purple) &nbsp; ● Group (green) &nbsp; ● Channel (orange)<br><small>Drag nodes to arrange · Drag background to pan · Scroll to zoom</small></div></div>
+<aside><label for="search">Find a person or community</label><input id="search" type="search" placeholder="Name or namespaced ID" style="width:100%;margin-top:8px"><ul id="results"></ul><h2 style="font-size:18px">Selected node</h2><div id="details"></div><h3 style="font-size:16px">Neighbors</h3><ul id="neighbors"></ul><button id="more" hidden>Show more neighbors</button><p class="muted" id="coverage"></p></aside></main>
+<script>
+'use strict';
+const graph = /*GRAPH_DATA*/null;
+const $ = id => document.getElementById(id);
+const kinds = {direct:'Direct messages',reply:'Replies',mention:'ID mentions',participation:'Message participation',membership:'Observed membership'};
+const nodes = new Map(graph.nodes.map(n=>[n.id,n]));
+const enabled = new Set(Object.keys(kinds));
+let center=graph.focus, selected=center, expanded=new Set([center]), visible=new Set(), active=[], adjacency=new Map(), positions=new Map(), component=new Set(), neighborLimit=50;
+let scale=1, pan={x:0,y:0}, width=1,height=1,drag=null, dirty=true;
+const canvas=$('canvas'),ctx=canvas.getContext('2d');
+const colors={user:'#80caff',bot:'#c6a0ff',group:'#80d4b0',channel:'#ffba76'};
+function text(el,value){el.textContent=value;}
+for(const [kind,label] of Object.entries(kinds)){
+ const holder=document.createElement('label'),input=document.createElement('input');input.type='checkbox';input.checked=true;input.dataset.kind=kind;
+ input.addEventListener('change',()=>{input.checked?enabled.add(kind):enabled.delete(kind);recompute();});holder.append(input,document.createTextNode(' '+label));$('types').append(holder);
+}
+function resetDates(){for(const key of ['from','to']){$(key).value=graph[key]||'';if(graph.from)$(key).min=graph.from;if(graph.to)$(key).max=graph.to;}}
+resetDates();
+text($('period'),`Exported UTC period: ${graph.from||'unbounded'} through ${graph.to||'unbounded'} (inclusive). Browser filters can only narrow this export.`);
+text($('coverage'),`Based on current retained message versions. Message edges use original send dates; membership uses snapshot observation dates and does not establish current membership. Participant lists and archive history may be incomplete. Skipped during export: ${graph.skipped.undated} undated evidence items, ${graph.skipped.unresolved} unresolved relationships. No message text is embedded.`);
+function validDates(){
+ const from=$('from').value,to=$('to').value;
+ const invalid = !$('from').validity.valid || !$('to').validity.valid || (from&&to&&from>to) || (graph.from&&(!from||from<graph.from)) || (graph.to&&(!to||to>graph.to));
+ text($('error'),invalid?'Enter a valid date range within the exported period.':'');return !invalid;
+}
+let appliedFrom=graph.from||'',appliedTo=graph.to||'';
+function counts(edge){
+ let count=0,first=null,last=null,undated=0;
+ for(const [day,n] of Object.entries(edge.days)){
+  if(day ? ((!appliedFrom||day>=appliedFrom)&&(!appliedTo||day<=appliedTo)) : (!appliedFrom&&!appliedTo)){
+   count+=n;if(day){if(!first||day<first)first=day;if(!last||day>last)last=day;}else undated+=n;
+  }
+ }
+ return {count,first,last,undated};
+}
+function recompute(){
+ active=[];adjacency=new Map();
+ for(const edge of graph.edges){if(!enabled.has(edge.kind))continue;const value=counts(edge);if(!value.count)continue;const e={...edge,...value};active.push(e);for(const id of [e.source,e.target]){if(!adjacency.has(id))adjacency.set(id,[]);adjacency.get(id).push(e);}}
+ component=new Set();const todo=[graph.focus];while(todo.length){const id=todo.pop();if(component.has(id))continue;component.add(id);for(const e of adjacency.get(id)||[])todo.push(e.source===id?e.target:e.source);}
+ if(!component.has(center)){center=graph.focus;expanded=new Set([center]);}if(!component.has(selected))selected=center;
+ expanded=new Set([...expanded].filter(id=>component.has(id)));updateVisible();search();
+}
+function neighbors(id){
+ const map=new Map();for(const e of adjacency.get(id)||[]){const target=e.source===id?e.target:e.source;if(!component.has(target))continue;if(!map.has(target))map.set(target,{id:target,weight:0,edges:[]});const n=map.get(target);n.edges.push(e);if(['direct','reply','mention'].includes(e.kind))n.weight+=e.count;}
+ return [...map.values()].sort((a,b)=>b.weight-a.weight||a.id.localeCompare(b.id));
+}
+function updateVisible(){
+ const candidates=new Set([center]);for(const id of expanded){candidates.add(id);for(const n of neighbors(id))candidates.add(n.id);}
+ const weights=new Map();for(const e of active){if(['direct','reply','mention'].includes(e.kind)){weights.set(e.source,(weights.get(e.source)||0)+e.count);weights.set(e.target,(weights.get(e.target)||0)+e.count);}}
+ const ordered=[...candidates].filter(id=>component.has(id)&&id!==center).sort((a,b)=>(weights.get(b)||0)-(weights.get(a)||0)||a.localeCompare(b));
+ visible=new Set([center,...ordered.slice(0,499)]);
+ let i=0;for(const id of visible){if(!positions.has(id)){const a=i++*2.399963;const radius=50+16*Math.sqrt(i);positions.set(id,id===center?{x:0,y:0}:{x:Math.cos(a)*radius,y:Math.sin(a)*radius});}}
+ text($('status'),`${visible.size} visible / ${component.size} connected nodes · ${Math.max(0,candidates.size-visible.size)} omitted from expanded view · Active UTC period: ${appliedFrom||'unbounded'} to ${appliedTo||'unbounded'}`);
+ details();dirty=true;
+}
+function select(id,recenter=false){selected=id;neighborLimit=50;if(recenter){center=id;expanded=new Set([id]);positions=new Map();pan={x:0,y:0};scale=1;}updateVisible();}
+function edgeDescription(e,id){const direction=['direct','reply','mention'].includes(e.kind)?(e.source===id?'outgoing':'incoming'):'undirected';return `${kinds[e.kind]}: ${e.count} (${direction}; ${e.kind==='membership'?'observed':'sent'} ${e.first||'unknown'}${e.last&&e.last!==e.first?' – '+e.last:''}${e.undated?'; '+e.undated+' undated':''})`;}
+function details(){
+ const node=nodes.get(selected);text($('details'),node?`${node.label}\n${node.id} · ${node.kind}`:'');
+ const list=$('neighbors');list.replaceChildren();const entries=neighbors(selected);
+ for(const n of entries.slice(0,neighborLimit)){const li=document.createElement('li'),button=document.createElement('button');const node=nodes.get(n.id);text(button,`${node.label} · ${n.id}\n${n.edges.map(e=>edgeDescription(e,selected)).join('\n')}`);button.style.whiteSpace='pre-wrap';button.addEventListener('click',()=>select(n.id,true));li.append(button);list.append(li);}
+ $('more').hidden=entries.length<=neighborLimit;
+ if(!entries.length){const li=document.createElement('li');text(li,'No relationships in the active filters.');list.append(li);}
+}
+function search(){
+ const query=$('search').value.trim().toLowerCase(),list=$('results');list.replaceChildren();if(!query)return;
+ const matches=graph.nodes.filter(n=>component.has(n.id)&&(n.label.toLowerCase().includes(query)||n.id.includes(query)));
+ for(const n of matches.slice(0,50)){const li=document.createElement('li'),button=document.createElement('button');text(button,`${n.label} · ${n.id}`);button.addEventListener('click',()=>select(n.id,true));li.append(button);list.append(li);}
+ const li=document.createElement('li');text(li,`${matches.length} matches${matches.length>50?' (first 50; refine search)':''}`);list.append(li);
+}
+$('search').addEventListener('input',search);$('more').onclick=()=>{neighborLimit+=50;details();};
+$('apply').onclick=()=>{if(validDates()){appliedFrom=$('from').value;appliedTo=$('to').value;recompute();}};
+$('reset').onclick=()=>{resetDates();appliedFrom=graph.from||'';appliedTo=graph.to||'';text($('error'),'');for(const input of $('types').querySelectorAll('input')){input.checked=true;enabled.add(input.dataset.kind);}center=graph.focus;selected=center;expanded=new Set([center]);positions=new Map();pan={x:0,y:0};scale=1;recompute();};
+$('expand').onclick=()=>{expanded.add(selected);updateVisible();};$('collapse').onclick=()=>select(selected,true);$('home').onclick=()=>select(graph.focus,true);
+function zoom(f){scale=Math.max(.15,Math.min(6,scale*f));dirty=true;}
+$('zoomIn').onclick=()=>zoom(1.2);$('zoomOut').onclick=()=>zoom(1/1.2);
+canvas.addEventListener('wheel',e=>{e.preventDefault();zoom(e.deltaY<0?1.1:1/1.1);},{passive:false});
+function point(e){const r=canvas.getBoundingClientRect();return {x:(e.clientX-r.left-width/2-pan.x)/scale,y:(e.clientY-r.top-height/2-pan.y)/scale};}
+function hit(p){return [...visible].reverse().find(id=>{const v=positions.get(id);return Math.hypot(v.x-p.x,v.y-p.y)<12/scale+5;});}
+canvas.addEventListener('pointerdown',e=>{const p=point(e),id=hit(p);drag={id,x:e.clientX,y:e.clientY};canvas.setPointerCapture(e.pointerId);if(id)select(id);});
+canvas.addEventListener('pointermove',e=>{if(!drag)return;if(drag.id){positions.set(drag.id,point(e));}else{pan.x+=e.clientX-drag.x;pan.y+=e.clientY-drag.y;}drag.x=e.clientX;drag.y=e.clientY;dirty=true;});
+canvas.addEventListener('pointerup',()=>{drag=null;});canvas.addEventListener('pointercancel',()=>{drag=null;});canvas.addEventListener('dblclick',e=>{const id=hit(point(e));if(id){selected=id;expanded.add(id);updateVisible();}});
+new ResizeObserver(()=>{const rect=canvas.getBoundingClientRect();width=rect.width;height=rect.height;const ratio=devicePixelRatio||1;canvas.width=width*ratio;canvas.height=height*ratio;dirty=true;}).observe(canvas);
+function draw(){
+ if(dirty){dirty=false;const ratio=devicePixelRatio||1;ctx.setTransform(ratio,0,0,ratio,0,0);ctx.clearRect(0,0,width,height);ctx.translate(width/2+pan.x,height/2+pan.y);ctx.scale(scale,scale);
+ for(const e of active){if(!visible.has(e.source)||!visible.has(e.target))continue;const a=positions.get(e.source),b=positions.get(e.target);ctx.strokeStyle=e.kind==='membership'?'#68856f':'#455976';ctx.lineWidth=Math.min(4,1+Math.log10(e.count+1))/scale;ctx.setLineDash(e.kind==='membership'?[4/scale,4/scale]:[]);ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();if(['direct','reply','mention'].includes(e.kind)){const angle=Math.atan2(b.y-a.y,b.x-a.x),x=b.x-Math.cos(angle)*12,y=b.y-Math.sin(angle)*12;ctx.beginPath();ctx.moveTo(x,y);ctx.lineTo(x-8*Math.cos(angle-.5),y-8*Math.sin(angle-.5));ctx.moveTo(x,y);ctx.lineTo(x-8*Math.cos(angle+.5),y-8*Math.sin(angle+.5));ctx.stroke();}}
+ ctx.setLineDash([]);for(const id of visible){const p=positions.get(id),n=nodes.get(id);ctx.beginPath();ctx.arc(p.x,p.y,id===center?10:7,0,Math.PI*2);ctx.fillStyle=colors[n.kind]||colors.user;ctx.fill();if(id===selected){ctx.strokeStyle='#fff';ctx.lineWidth=2/scale;ctx.stroke();}if(visible.size<100||id===selected||id===center){ctx.fillStyle='#e5edf7';ctx.font=`${12/scale}px system-ui`;ctx.fillText(n.label.slice(0,36),p.x+12,p.y+4);}}
+ }requestAnimationFrame(draw);
+}
+recompute();requestAnimationFrame(draw);
+</script></html>

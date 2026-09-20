@@ -487,3 +487,42 @@ endpoints. Existing server authentication applies. Older servers retain record
 browsing and existing-format exports; explorer-specific features require an
 updated server. See [vendor/README.md](vendor/README.md) for the small upstream
 compatibility patches needed by the dependency policy and Rust 1.88 baseline.
+
+## Offline social graph
+
+```sh
+tg-backup --dataset ./dataset graph --focus user:123 \
+  --from 2025-01-01 --to 2025-12-31 --output graph.html
+```
+
+Open the generated HTML in a browser. It is self-contained and works offline,
+with no external scripts or network requests. The export contains the focal
+person's entire connected component; the initial view shows immediate neighbors.
+Search to recenter, expand selected nodes, filter relationship types, and use the
+From/To controls to narrow the exported period. Reset restores the original
+filters. The canvas displays at most 500 nodes; search and the paged neighbor
+list provide access to the remaining connected nodes. Drag nodes or the background
+to arrange or pan, and scroll or use the zoom buttons to zoom.
+
+`--from` and `--to` are optional inclusive UTC calendar dates in `YYYY-MM-DD`
+format. Omitted bounds are unbounded. Browser filters cannot recover evidence
+outside the exported period. Messages use their original Telegram send date,
+not their edit or collection date. Membership uses the participant snapshot's
+observation date, **not a claim of membership throughout that day or today**.
+Undated evidence is excluded whenever a date bound is active.
+
+Edges distinguish directed private messages, replies, ID-based mentions,
+message participation in groups/channels, and observed membership. Repeated
+mentions within a message count once per target; membership is counted once per
+person/community/observation day across overlapping snapshots. Counts use current
+retained ordinary message versions, excluding deleted, scheduled and quick-reply
+messages. Replies can resolve authors from messages outside the selected period.
+Shared communities, forwarded authors and ambiguous username mentions do not
+establish person-to-person interactions. Missing identities and unresolved reply
+targets are reported. An existing person without matching edges remains an
+isolated node. Incomplete participant lists and archive history limit coverage.
+
+Graph exports contain names, exact namespaced IDs and daily relationship counts,
+but no message bodies, phone numbers, attachments or credentials. Existing output
+requires `--overwrite`; completed output is published atomically. Generation is
+local and read-only and does not contact Telegram or change the dataset.

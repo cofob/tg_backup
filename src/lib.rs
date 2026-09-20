@@ -21,3 +21,5 @@ pub mod maintenance_worker;
 pub mod shutdown;
 
 pub mod explorer;
+
+pub mod graph;
