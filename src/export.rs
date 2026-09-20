@@ -1,7 +1,4 @@
-use crate::{
-    archive::Archive,
-    query::{Query, public_json},
-};
+use crate::{archive::Archive, query::Query};
 use anyhow::Result;
 use std::io::Write;
 pub use tg_backup_protocol::{Format, escape};
@@ -30,48 +27,11 @@ pub fn export_media(
     selection: tg_backup_protocol::MediaSelection,
 ) -> Result<u64> {
     let mut query = query.clone();
-    let mut count = 0;
-    if matches!(format, Format::Json) {
-        write!(out, "[")?;
-    }
-    if matches!(format, Format::Html) {
-        write!(
-            out,
-            "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>Telegram archive</title><style>body{{font:16px system-ui;max-width:70rem;margin:2rem auto;padding:1rem}}article{{border-bottom:1px solid #ccc;padding:1rem}}pre{{white-space:pre-wrap;overflow-wrap:anywhere}}</style>"
-        )?;
-    }
+    let mut writer = tg_backup_protocol::export::RecordWriter::new(&mut out, format)?;
     loop {
         let page = archive.query(&query)?;
         for record in page.records {
-            match format {
-                Format::Json | Format::Ndjson => {
-                    if count > 0 && matches!(format, Format::Json) {
-                        write!(out, ",")?;
-                    }
-                    let mut value = serde_json::to_value(&record)?;
-                    public_json(&mut value);
-                    serde_json::to_writer(&mut out, &value)?;
-                    writeln!(out)?;
-                }
-                Format::Txt => writeln!(
-                    out,
-                    "[{}] {} {}{}\n{}\n",
-                    record.observed_at,
-                    record.key,
-                    record.source,
-                    if record.deleted { " [deleted]" } else { "" },
-                    crate::tl::text(&record.data)
-                )?,
-                Format::Html => write!(
-                    out,
-                    "<article><h3>{}</h3><small>{} · {}{}</small><pre>{}</pre></article>",
-                    escape(&record.key),
-                    record.observed_at,
-                    escape(&record.source),
-                    if record.deleted { " · deleted" } else { "" },
-                    escape(&crate::tl::text(&record.data))
-                )?,
-            }
+            writer.record(&record)?;
             if let Some(dest) = attachments {
                 for hash in record.media_hashes(selection) {
                     std::fs::create_dir_all(dest)?;
@@ -84,16 +44,11 @@ pub fn export_media(
                     }
                 }
             }
-            count += 1;
         }
         let Some(cursor) = page.next_cursor else {
             break;
         };
         query.cursor = Some(cursor);
     }
-    if matches!(format, Format::Json) {
-        writeln!(out, "]")?;
-    }
-    out.flush()?;
-    Ok(count)
+    Ok(writer.finish()?)
 }

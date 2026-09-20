@@ -329,3 +329,84 @@ API and metrics bind localhost by default. To access them through published cont
 Metrics are disabled unless `metrics_bind` is set, or run `tg-backup metrics` for localhost:9090. `/metrics` uses a separate optional `metrics_token` reference or `TG_BACKUP_METRICS_TOKEN`. Scrapes read a five-second cached snapshot, with low-cardinality counts for ingestion, journal backlog, objects, media, coverage failures, queue states, representations, schedule and CPU budget. No peer IDs, message text or secrets are metric labels.
 
 CI follows patterns from [codex-start](https://github.com/cofob/codex-start), [randd](https://github.com/cofob/randd), [fastside](https://github.com/cofob/fastside) and [incus-rpm-repo](https://github.com/cofob/incus-rpm-repo): pinned actions, minimal permissions, separate validation/artifact/publishing jobs, native architecture runners, deterministic archives and checksums. Zizmor, actionlint, ShellCheck, formatting, Clippy, tests and cargo-deny gate releases. Dependency duplicates are denied without per-package bypasses; update the checked-in lockfile deliberately and re-run `cargo deny --workspace check`.
+
+## Interactive archive explorer
+
+```sh
+tg-backup --dataset ./dataset tui
+tg-backup-client --url http://127.0.0.1:8080 tui
+tg-backup-client --profile home tui
+```
+
+Both commands use the same read-only terminal interface. The standalone client
+uses its existing URL, profile and bearer-token settings; it still contains no
+Telegram, SQLite, zstd or server dependencies. An interactive stdin/stdout is
+required. Use the existing query/export commands in scripts and pipelines.
+
+- **1 Chats:** browse folders, private chats, groups and channels; press `t` for
+  forum topics. Message-only peers remain discoverable when dialog metadata is
+  absent. Messages start with the newest Telegram message ID; `n` loads older
+  pages. Topic views include the root message. The sidebar retains the current
+  chat/topic list while a conversation is open.
+- **2 Records:** browse every archived kind, including unknown kinds and response
+  envelopes. `/` sets full-text search. `f` opens text, regex, selector, kind,
+  observation-time, all-versions, peer and topic filters. `h` opens the selected
+  object's history. Enter expands JSON fields; Enter on a scalar opens its full
+  text, with scrolling and Esc to return.
+- **3 Storage:** inspect catalog/epoch table definitions and typed rows. `s` links
+  a selected record to its observation, journal/payload, archived TL schema,
+  compressed block and dictionary. `d` returns to the database list. `a` lists
+  attachment or text/BLOB fields; Enter opens paged hex/text inspection. Integers
+  stay exact strings, SQL text stays text, and large text/BLOB values are fetched
+  separately. `checkpoints` omits private takeout state. Authentication/session
+  databases and configuration credentials are never exposed.
+- **4 Operations:** inspect status, jobs, coverage, media, work and maintenance.
+  These and physical table rows are live views; record pagination preserves its
+  observation snapshot. Maintenance invalidation asks you to refresh.
+
+Use Tab/Shift-Tab to select panes, arrows or `j`/`k` to move, Enter to open,
+Esc to go back, `n`/`b` for next/previous pages, and `r` to refresh explicitly.
+Mouse selection and scrolling are supported. Narrow terminals show one focused
+pane. `g` opens folders, `c` opens all chats, and `?` shows help. `q` or Ctrl-C
+exits and restores the terminal. No actions send Telegram messages, modify the
+archive, run sync or execute maintenance.
+
+Press `p` on an attachment to request an inline JPEG/PNG/WebP/GIF preview in a
+terminal supporting Kitty, iTerm2 or Sixel graphics. Unsupported terminals,
+missing files, unsupported formats and images exceeding 16 MiB/40 megapixels
+show a diagnostic while keeping metadata/export available. Animated images show
+the first frame. Previews decode off the rendering loop and are regenerated on
+request after resize; no external viewer is launched.
+
+### TUI exports
+
+Press `e`, fill the form with Tab/Shift-Tab, and press Enter. Ctrl-U clears a
+field. Choose `record`, `view`, `chat`, `topic`, `archive`, `row`, `table`, or
+`binary`; supply a local output path. `chat` includes all topics, while
+`topic`/`view` preserves the opened topic. Record/view/archive exports offer
+NDJSON (default), JSON, TXT and HTML, all versions, and optional attachments
+with `original`, `preferred`, or `all` representations. A selected record exports
+that exact observation; enabling all versions exports its retained history.
+Queries can also use `--peer channel:123 --topic 456` outside the TUI.
+
+Exports follow every matching page, regardless of the pages loaded onscreen.
+Raw row/table exports use typed JSON/NDJSON; binary exports save exact bytes
+(including schema text, original TL, compressed blocks, dictionaries or media).
+Raw tables are live diagnostic exports, not transactional dataset backups.
+Use the documented whole-dataset backup procedure for a restorable backup.
+
+Existing output requires typing `YES` in the overwrite field. Completed files
+are published from staging files; Esc cancels and removes incomplete files.
+Successfully copied attachments may remain after cancellation/failure. Attachment
+hashes are verified, missing files are reported, and incomplete exports are never
+reported as complete.
+
+The additive read-only endpoints are `GET /v2/explorer/capabilities`,
+`POST /v2/explorer/browse` and `POST /v2/explorer/binary`. Browse requests use the
+shared typed target enum for conversations, folders, topics, messages, databases,
+tables, rows, record locations and operations. Binary requests use server-resolved
+references with bounded offsets/lengths. There are no arbitrary SQL or file-path
+endpoints. Existing server authentication applies. Older servers retain record
+browsing and existing-format exports; explorer-specific features require an
+updated server. See [vendor/README.md](vendor/README.md) for the small upstream
+compatibility patches needed by the dependency policy and Rust 1.88 baseline.

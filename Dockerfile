@@ -3,6 +3,7 @@ RUN apt-get update && apt-get install --no-install-recommends -y clang libclang-
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY vendor ./vendor
 COPY schemas ./schemas
 COPY src ./src
 RUN cargo build --locked --release --workspace --bins

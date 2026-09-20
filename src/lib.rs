@@ -19,3 +19,5 @@ pub mod setup;
 pub mod maintenance_worker;
 
 pub mod shutdown;
+
+pub mod explorer;

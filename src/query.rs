@@ -133,6 +133,15 @@ impl Archive {
             scanned += 1;
             after = *id;
             let record = self.record(*id)?;
+            if q.peer
+                .as_ref()
+                .is_some_and(|peer| !record.key.starts_with(&format!("{peer}/message:")))
+                || q.topic
+                    .as_ref()
+                    .is_some_and(|topic| !crate::explorer::topic_matches(&record, topic))
+            {
+                continue;
+            }
             let mut context = record.metadata.clone();
             if !context.is_object() {
                 context = json!({});

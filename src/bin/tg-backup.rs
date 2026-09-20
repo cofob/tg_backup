@@ -21,6 +21,8 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Interactively explore and export the archive (read-only).
+    Tui,
     Init {
         #[arg(long, value_enum, default_value = "monthly")]
         epoch: EpochPeriod,
@@ -123,6 +125,12 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     match cli.command {
+        Command::Tui => {
+            tg_backup_tui::run(std::sync::Arc::new(tg_backup::explorer::LocalBackend {
+                root: cli.dataset,
+            }))
+            .await?
+        }
         Command::Init { epoch } => {
             let a = Archive::init(
                 &cli.dataset,

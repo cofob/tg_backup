@@ -26,6 +26,14 @@ pub struct Record {
 pub struct Query {
     #[arg(long, default_value = "true")]
     pub selector: String,
+    /// Restrict messages to this namespaced peer.
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+    /// Restrict messages to this forum topic, including its root message.
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     #[arg(long)]
     pub key: Option<String>,
     #[arg(long)]
@@ -50,6 +58,8 @@ impl Default for Query {
     fn default() -> Self {
         Self {
             selector: "true".into(),
+            peer: None,
+            topic: None,
             key: None,
             kind: None,
             text: None,
@@ -226,3 +236,6 @@ impl Record {
         hashes.into_iter().collect()
     }
 }
+
+pub mod explorer;
+pub mod export;

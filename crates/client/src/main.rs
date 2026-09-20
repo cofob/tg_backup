@@ -1,8 +1,9 @@
 mod config;
+mod explorer;
 use anyhow::{Result, ensure};
 use clap::{Parser, Subcommand};
 use std::{io::Write, path::PathBuf};
-use tg_backup_protocol::{Format, Page, Query, escape, public_json};
+use tg_backup_protocol::{Format, Page, Query};
 #[derive(Parser)]
 #[command(version, about = "Read-only HTTP client for tg_backup")]
 struct Cli {
@@ -17,6 +18,8 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Interactively explore and export the remote archive.
+    Tui,
     Query(Query),
     History {
         key: String,
@@ -165,6 +168,13 @@ async fn main() -> Result<()> {
         }
     };
     match cli.command {
+        Command::Tui => {
+            tg_backup_tui::run(std::sync::Arc::new(explorer::HttpBackend::new(
+                url.into(),
+                token.clone(),
+            )?))
+            .await?
+        }
         Command::Setup { .. } | Command::Credential { .. } => unreachable!(),
         Command::Status(options) => loop {
             use std::io::IsTerminal;
@@ -248,16 +258,7 @@ async fn main() -> Result<()> {
             } else {
                 Box::new(std::io::stdout().lock())
             };
-            let mut count = 0;
-            if matches!(format, Format::Json) {
-                write!(out, "[")?;
-            }
-            if matches!(format, Format::Html) {
-                write!(
-                    out,
-                    "<!doctype html><meta charset=\"utf-8\"><title>Telegram archive</title>"
-                )?;
-            }
+            let mut writer = tg_backup_protocol::export::RecordWriter::new(&mut out, format)?;
             loop {
                 let response = auth(client.post(format!("{url}/v2/query")).json(&query))
                     .send()
@@ -270,31 +271,7 @@ async fn main() -> Result<()> {
                 );
                 let page: Page = response.json().await?;
                 for record in page.records {
-                    match format {
-                        Format::Json | Format::Ndjson => {
-                            if count > 0 && matches!(format, Format::Json) {
-                                write!(out, ",")?;
-                            }
-                            let mut v = serde_json::to_value(&record)?;
-                            public_json(&mut v);
-                            serde_json::to_writer(&mut out, &v)?;
-                            writeln!(out)?;
-                        }
-                        Format::Txt => writeln!(
-                            out,
-                            "[{}] {} {}\n{}\n",
-                            record.observed_at,
-                            record.key,
-                            record.source,
-                            tg_backup_protocol::text(&record.data)
-                        )?,
-                        Format::Html => writeln!(
-                            out,
-                            "<article><h3>{}</h3><pre>{}</pre></article>",
-                            escape(&record.key),
-                            escape(&tg_backup_protocol::text(&record.data))
-                        )?,
-                    }
+                    writer.record(&record)?;
                     if let Some(directory) = &attachments {
                         std::fs::create_dir_all(directory)?;
                         for hash in record.media_hashes(media) {
@@ -308,7 +285,6 @@ async fn main() -> Result<()> {
                             .await?;
                         }
                     }
-                    count += 1;
                 }
                 if let Some(cursor) = page.next_cursor {
                     query.cursor = Some(cursor);
@@ -316,10 +292,7 @@ async fn main() -> Result<()> {
                     break;
                 }
             }
-            if matches!(format, Format::Json) {
-                writeln!(out, "]")?;
-            }
-            out.flush()?;
+            writer.finish()?;
         }
     }
     Ok(())

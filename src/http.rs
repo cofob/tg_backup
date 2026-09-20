@@ -159,9 +159,50 @@ async fn attachment(
     )
         .into_response())
 }
+async fn explorer_capabilities(State(_state): State<Arc<ApiState>>) -> ApiResult {
+    Ok(Json(
+        serde_json::to_value(tg_backup_protocol::explorer::Capabilities {
+            version: 1,
+            storage: true,
+            conversations: true,
+        })
+        .map_err(error)?,
+    ))
+}
+async fn explorer_browse(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<tg_backup_protocol::explorer::BrowseRequest>,
+) -> ApiResult {
+    tokio::task::spawn_blocking(move || {
+        let archive = Archive::open(&state.root, false)?;
+        let mut value = serde_json::to_value(archive.explore(&request)?)?;
+        public_json(&mut value);
+        Ok::<_, anyhow::Error>(Json(value))
+    })
+    .await
+    .map_err(error)?
+    .map_err(error)
+}
+async fn explorer_binary(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<tg_backup_protocol::explorer::BinaryRequest>,
+) -> ApiResult {
+    tokio::task::spawn_blocking(move || {
+        let archive = Archive::open(&state.root, false)?;
+        Ok::<_, anyhow::Error>(Json(serde_json::to_value(
+            archive.explorer_binary(&request)?,
+        )?))
+    })
+    .await
+    .map_err(error)?
+    .map_err(error)
+}
 pub fn router(state: ApiState) -> Router {
     let state = Arc::new(state);
     Router::new()
+        .route("/v2/explorer/capabilities", get(explorer_capabilities))
+        .route("/v2/explorer/browse", post(explorer_browse))
+        .route("/v2/explorer/binary", post(explorer_binary))
         .route("/v2/query", post(query).get(get_query))
         .route("/v2/objects", get(get_query))
         .route("/v2/messages", post(messages))

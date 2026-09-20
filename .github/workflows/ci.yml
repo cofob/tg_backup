@@ -58,6 +58,10 @@ jobs:
       - run: cargo +1.98.1 fmt --all --check
       - run: cargo +1.98.1 clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo +1.98.1 test --locked --workspace --all-targets
+      - name: Smoke-test both terminal explorers
+        run: |
+          cargo +1.98.1 build --locked --workspace --bins
+          python3 ci/tui-smoke.py
       - name: Test real media codecs
         if: runner.os == 'Linux'
         run: |
