@@ -8,8 +8,19 @@ concurrency:
   group: images-${{ github.ref }}
   cancel-in-progress: false
 jobs:
-  image:
-    runs-on: ubuntu-24.04
+  build:
+    name: Build image (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
@@ -17,51 +28,141 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - name: Build and test image before publishing
-        run: |
-          docker build --target ffmpeg -t tg-backup:smoke .
-          ci/container-smoke.sh
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push core by digest
+        id: core
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          target: core
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=ghcr.io/cofob/tg-backup,push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+          provenance: false
+          cache-from: type=gha,scope=${{ matrix.arch }}-core
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}-core
+      - name: Save core digest
+        env:
+          DIGEST: ${{ steps.core.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests/core"
+          touch "$RUNNER_TEMP/digests/core/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: digests-core-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/core/*
+          retention-days: 1
+          if-no-files-found: error
+      - name: Build and push FFmpeg image by digest
+        id: ffmpeg
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          target: ffmpeg
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=ghcr.io/cofob/tg-backup,push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+          provenance: false
+          cache-from: |
+            type=gha,scope=${{ matrix.arch }}-core
+            type=gha,scope=${{ matrix.arch }}-ffmpeg
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}-ffmpeg
+      - name: Smoke-test the exact FFmpeg image
+        env:
+          DIGEST: ${{ steps.ffmpeg.outputs.digest }}
+        run: |
+          docker pull "ghcr.io/cofob/tg-backup@$DIGEST"
+          docker tag "ghcr.io/cofob/tg-backup@$DIGEST" tg-backup:smoke
+          ci/container-smoke.sh
+      - name: Save FFmpeg digest
+        env:
+          DIGEST: ${{ steps.ffmpeg.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests/ffmpeg"
+          touch "$RUNNER_TEMP/digests/ffmpeg/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: digests-ffmpeg-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/ffmpeg/*
+          retention-days: 1
+          if-no-files-found: error
+
+  merge:
+    name: Publish multi-architecture manifests
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: digests-core-*
+          path: ${{ runner.temp }}/digests/core
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: digests-ffmpeg-*
+          path: ${{ runner.temp }}/digests/ffmpeg
+          merge-multiple: true
       - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
-        id: meta
+        id: core-meta
         with:
           images: ghcr.io/cofob/tg-backup
           tags: |
             type=sha
             type=semver,pattern={{version}}
-            type=raw,value=latest,enable={{is_default_branch}}
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          target: core
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=core
-          cache-to: type=gha,mode=max,scope=core
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
       - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
-        id: ffmpeg
+        id: ffmpeg-meta
         with:
           images: ghcr.io/cofob/tg-backup
           flavor: suffix=-ffmpeg,onlatest=true
           tags: |
             type=sha
             type=semver,pattern={{version}}
-            type=raw,value=latest,enable={{is_default_branch}}
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          target: ffmpeg
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.ffmpeg.outputs.tags }}
-          labels: ${{ steps.ffmpeg.outputs.labels }}
-          cache-from: type=gha,scope=ffmpeg
-          cache-to: type=gha,mode=max,scope=ffmpeg
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
+      - name: Create and verify manifests
+        env:
+          CORE_TAGS: ${{ steps.core-meta.outputs.tags }}
+          FFMPEG_TAGS: ${{ steps.ffmpeg-meta.outputs.tags }}
+        run: |
+          create_manifest() {
+            digest_dir=$1
+            tags=$2
+            tag_args=()
+            first_tag=
+            while IFS= read -r tag; do
+              if [ -n "$tag" ]; then
+                tag_args+=(--tag "$tag")
+                if [ -z "$first_tag" ]; then first_tag=$tag; fi
+              fi
+            done <<< "$tags"
+            sources=()
+            for digest_file in "$digest_dir"/*; do
+              sources+=("ghcr.io/cofob/tg-backup@sha256:$(basename "$digest_file")")
+            done
+            test "${#sources[@]}" -eq 2
+            test -n "$first_tag"
+            docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+            docker buildx imagetools inspect "$first_tag"
+          }
+          create_manifest "$RUNNER_TEMP/digests/core" "$CORE_TAGS"
+          create_manifest "$RUNNER_TEMP/digests/ffmpeg" "$FFMPEG_TAGS"

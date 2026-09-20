@@ -27,6 +27,9 @@ jobs:
   checks:
     needs: validate-tag
     uses: $/.github/workflows/ci.yml
+    with:
+      skip_container_smoke: true
+      skip_release_build: true
   images:
     needs: checks
     permissions:
