@@ -5,7 +5,7 @@ exclude = ["vendor/ratatui-image", "vendor/kasuari"]
 
 [package]
 name = "tg-backup"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2024"
 publish = false
 rust-version = "1.88"
@@ -19,9 +19,9 @@ name = "tg-backup"
 path = "src/bin/tg-backup.rs"
 
 [dependencies]
-tg-backup-tui = { version = "2.1.0", path = "crates/tui" }
-tg-backup-credentials = { version = "2.1.0", path = "crates/credentials" }
-tg-backup-protocol = { version = "2.1.0", path = "crates/protocol" }
+tg-backup-tui = { version = "2.2.0", path = "crates/tui" }
+tg-backup-credentials = { version = "2.2.0", path = "crates/credentials" }
+tg-backup-protocol = { version = "2.2.0", path = "crates/protocol" }
 anyhow = "1"
 axum = "0.8"
 base64 = "0.22"

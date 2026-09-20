@@ -1,16 +1,16 @@
-# tg_backup 2.1.0
+# tg_backup 2.2.0
 
-Shared interactive archive explorer for the local CLI and standalone HTTP client.
+Expanded read-only Telegram exports with resumable collection and explicit coverage reporting.
 
-- Run `tg-backup --dataset PATH tui` or `tg-backup-client --profile NAME tui`.
-- Browse chats, forum topics, messages, archived records and object history, raw storage, and operational status.
-- Search and filter records, inspect decoded metadata and original bytes, and preview retained images in compatible terminals.
-- Export complete scopes across pagination as JSON, NDJSON, TXT, or HTML, with optional verified attachment downloads; download raw storage bytes and typed rows.
-- Navigate with keyboard or mouse, manually refresh, and retain selection between abstraction levels.
-- Authenticated read-only explorer APIs support the remote interface. Older servers retain record browsing and export with reduced capabilities.
+- Collect call history, Stars balances and transactions, subscriptions, available payment receipts, saved payment information, gifts and collectibles, boosts, business settings and quick replies, channel statistics, shared locations, story viewers and reactions, and available bot/mini-app metadata.
+- Export scheduled messages as a separate dataset. Ordinary messages, scheduled messages and quick replies use distinct identities; updates, deletions and complete schedule-queue snapshots preserve retained history without mixing these namespaces.
+- Preserve every response page and atomically checkpoint pagination. Resume interrupted lists, detect repeated cursors, and retain exact native TL payloads and attachment references.
+- Load channel statistics and asynchronous graphs from the appropriate datacenter. Refresh scheduled, quick-reply, story and gift attachment references through their original APIs.
+- Use existing query/export commands, the HTTP client and the shared TUI for new record kinds. JSON/NDJSON retain all decoded fields; TXT/HTML include structured details for metadata-only records.
+- Report unsupported local data, expired or inaccessible history, filtered results and unfinished collectors in coverage. Uploaded contacts require takeout mode.
 
-Browsing does not migrate or modify datasets. Exports write to the machine running the TUI and require an output path. Whole-archive record export is not a filesystem backup.
+Collectors run automatically during sync; continuous mode refreshes completed snapshots. Existing archives remain readable without migration. Completeness describes data available through the API at collection time, not all historical account activity. Device-local settings, cache, unsynchronized drafts and mini-app local storage are outside API coverage.
 
-Includes Linux and macOS terminal smoke tests, shared export formatting, bounded background requests and image decoding, and terminal restoration on exit.
+Validation: 70 workspace tests passed, including 14 new collector tests; formatting and Clippy passed. Live account validation remains opt-in and was not run for this change.
 
 Release assets contain static Linux clients for x86_64 and aarch64 with SHA-256 checksums. Container images are published to `ghcr.io/cofob/tg-backup` in core and FFmpeg variants.

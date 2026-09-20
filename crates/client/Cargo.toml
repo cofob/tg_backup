@@ -1,13 +1,13 @@
 [package]
 name = "tg-backup-client"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2024"
 publish = false
 rust-version = "1.88"
 [dependencies]
-tg-backup-tui = { version = "2.1.0", path = "../tui" }
-tg-backup-credentials = { version = "2.1.0", path = "../credentials" }
-tg-backup-protocol = { version = "2.1.0", path = "../protocol" }
+tg-backup-tui = { version = "2.2.0", path = "../tui" }
+tg-backup-credentials = { version = "2.2.0", path = "../credentials" }
+tg-backup-protocol = { version = "2.2.0", path = "../protocol" }
 anyhow = "1"
 clap = { version = "=4.6.3", features = ["derive"] }
 serde = { version = "=1.0.228", features = ["derive"] }

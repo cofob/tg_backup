@@ -125,6 +125,83 @@ Every collector records success, progress, inaccessible data, or failure. Some e
 
 Live account validation is opt-in; automated tests use deterministic fixtures. This rewrite has not been validated against a production account merely by running its offline suite.
 
+### Additional account data
+
+These collectors run automatically during `sync` and refresh in `sync --continuous`.
+They use the pinned Telegram schema and read-only user API methods. No installed
+Telegram client profile or mini-app storage is read.
+
+| Data | Export kinds | What is collected / limits |
+| --- | --- | --- |
+| Calls | `call` | Paginated global phone-call search, plus phone/group-call service events in collected messages. Deleted or unobserved calls cannot be recovered. |
+| Stars and payments | `stars_balance`, `stars_transaction`, `stars_subscription`, `payment`, `payment_receipt`, `payment_info`, `stars_revenue` | Balance, all available transaction/subscription pages, payment/refund service events, available receipts and saved payment information. Channel finances require the relevant rights. Amounts retain their native units, currencies and fractional fields. |
+| Gifts and collectibles | `gift`, `saved_gift`, `gift_collection`, `gift_event` | Saved gifts including unsaved/unique items exposed by Telegram, collections, unique-gift details, gift media and observed transfer/upgrade events. Catalog gift IDs and owned gift instances remain distinct. |
+| Boosts | `boost`, `boost_status`, `boost_event` | Own boost slots, channel status, accessible ordinary/gift boost lists and observed service events. Current lists are snapshots, not an exhaustive past boost history. |
+| Business | `business`, `quick_reply`, `quick_reply_message` | Business profile fields, connected bots/rights, chat links, greeting/away rules and every message returned for each quick-reply shortcut. External automation workflows are unavailable. |
+| Channel statistics | `statistics` | Available channel/supergroup statistics and asynchronous graphs, requested from `stats_dc`. Returned reporting periods and graph failures are retained. |
+| Locations | `location` | Geo points, venues and live locations in collected messages, plus up to 100 recent locations per selected peer. Only observed live-location revisions are retained; this is not a GPS timeline. |
+| Story viewers | `story`, `story_views`, `story_viewer`, `story_reaction` | Counts and all accessible viewer pages for own stories; available reaction pages for administered channel/supergroup stories. Expired viewer lists, channel viewer identities and a complete log of stories you viewed are not available. |
+| Bots and mini-apps | `bot_activity`, `bot_app` | Cloud bot/service-message activity, top peers including mini-app categories, attachment-menu bots, web authorizations, bot profiles and details of discovered apps. Local storage and internal app activity are unavailable. Bot conversations remain ordinary messages with `category = bot`. |
+| Settings, contacts, drafts | existing native records / `rpc` | Existing cloud collectors remain active. `sync --takeout` also collects uploaded contacts with `contacts.getSaved`. Device-only settings/cache/contacts and unsynchronized drafts are unavailable. |
+| Scheduled messages | `scheduled_message` | An uncached schedule-queue snapshot for every selected discovered peer, including Saved Messages and archived chats, plus observed scheduled updates/deletions. Completeness is per successful peer request, not a simultaneous account-wide snapshot. |
+
+Native RPC envelopes and child objects are retained. List responses have separate
+page keys, so the default current-object export does not overwrite earlier pages
+of a list. Use `--all-versions` to include all retained observations; current views
+show the latest observed state of each object, not a claim that every object still
+exists on Telegram. An empty history search never deletes prior history. Complete
+scheduled-queue snapshots additionally mark previously observed absent entries as
+removed from the queue; this does not delete their retained versions. Updates
+received while that snapshot request was in flight take precedence.
+
+Scheduled keys use `user:123/scheduled_message:456` (also `chat:`/`channel:`).
+Quick-reply messages use `account/quick_reply:7/message:456`. Their IDs cannot
+replace ordinary `user:123/message:456` records. Explicit deletion updates retain
+tombstones in their respective namespaces. File-reference refresh uses the
+scheduled/quick-reply/story/gift API appropriate to the original attachment.
+
+```sh
+tg-backup sync --takeout
+tg-backup export --kind scheduled_message --format json --output scheduled.json
+tg-backup export --kind stars_transaction --all-versions --output stars.ndjson
+tg-backup export --kind saved_gift --attachments ./gift-media --output gifts.ndjson
+tg-backup export --kind call --format html --output calls.html
+tg-backup export --kind quick_reply_message --format txt --output quick-replies.txt
+tg-backup-client export --kind statistics --output statistics.ndjson
+tg-backup coverage > coverage.json
+tg-backup-client coverage
+```
+
+JSON/NDJSON include the complete decoded TL objects. TXT/HTML include structured
+details for these types, including amounts, dates, coordinates and graph data.
+The same kinds are queryable over HTTP and in the TUI record explorer.
+
+Coverage entries under `extra/` include job, scope, method/progress where relevant
+and completeness limits. `complete` means that the available API snapshot was
+exhausted; it does not promise all historical data. `limited` describes filtered
+or inherently restricted results; `inaccessible` describes permission errors;
+`incomplete` includes failed requests, truncated results and repeated cursors.
+`unsupported`, `requires_takeout`, `excluded`, `not_applicable`, `not_started` and
+`in_progress` distinguish the remaining cases. A stopped/limited sync leaves
+unvisited categories or peers visibly unfinished. These gaps are reflected in the
+job status rather than silently being called a full backup.
+
+Phone-call search shares the message budget with history. Selectors and date/ID
+bounds apply to call-history messages; message selectors also apply to scheduled
+snapshots and recent locations. Other account metadata is collected as before.
+A new job retries unavailable data; resume continues durable list cursors, while
+continuous mode starts fresh snapshots after completed scans. Enrichment work is
+derived from retained objects, so a restart after a list response does not discard
+pending gift, quick-reply, story-viewer or receipt requests.
+
+Existing archives remain readable without a schema migration. New collection
+cannot restore data never captured previously or already removed by Telegram.
+API references: [calls and search](https://core.telegram.org/api/search),
+[scheduled messages](https://core.telegram.org/api/scheduled-messages),
+[stories and viewer limits](https://core.telegram.org/api/stories),
+[channel statistics](https://core.telegram.org/api/stats),
+[business settings](https://core.telegram.org/api/business).
+
 ## Queries and exports
 
 ```sh

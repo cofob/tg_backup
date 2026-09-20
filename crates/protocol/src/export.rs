@@ -40,7 +40,7 @@ impl<W: Write> RecordWriter<W> {
                 record.key,
                 record.source,
                 if record.deleted { " [deleted]" } else { "" },
-                text(&record.data)
+                display_text(record)
             )?,
             Format::Html => write!(
                 self.out,
@@ -49,7 +49,7 @@ impl<W: Write> RecordWriter<W> {
                 record.observed_at,
                 escape(&record.source),
                 if record.deleted { " · deleted" } else { "" },
-                escape(&text(&record.data))
+                escape(&display_text(record))
             )?,
         }
         self.count += 1;
@@ -61,5 +61,19 @@ impl<W: Write> RecordWriter<W> {
         }
         self.out.flush()?;
         Ok(self.count)
+    }
+}
+
+// Metadata-only TL objects must remain useful in human-readable exports too.
+fn display_text(record: &Record) -> String {
+    let summary = text(&record.data);
+    if matches!(record.kind.as_str(), "message" | "user" | "chat") && !summary.is_empty() {
+        return summary;
+    }
+    let details = serde_json::to_string_pretty(&record.data).unwrap_or_default();
+    if summary.is_empty() {
+        details
+    } else {
+        format!("{summary}\n{details}")
     }
 }

@@ -1,4 +1,5 @@
 //! Read-only Telegram capture. Every collector archives native TL before advancing its cursor.
+mod extra;
 use crate::session::SqliteSession;
 use crate::{
     archive::{Archive, Capture},
@@ -63,7 +64,16 @@ pub struct SyncOptions {
     #[arg(long)]
     pub attachment_selector: Option<String>,
 }
+#[cfg(test)]
+struct MockReply {
+    method: &'static str,
+    args: Value,
+    dc: Option<i32>,
+    result: std::result::Result<Value, String>,
+}
 struct Engine {
+    #[cfg(test)]
+    mock_rpc: Option<Mutex<std::collections::VecDeque<MockReply>>>,
     client: Client,
     session: Arc<SqliteSession>,
     archive: Shared,
@@ -264,6 +274,8 @@ pub async fn sync(root: &Path, mut options: SyncOptions) -> Result<()> {
     let work_task = tokio::spawn(crate::work::run(archive.clone(), false));
     let stop = tokio_util::sync::CancellationToken::new();
     let mut engine = Engine {
+        #[cfg(test)]
+        mock_rpc: None,
         client: client.clone(),
         session: session.clone(),
         archive: archive.clone(),
@@ -303,6 +315,8 @@ pub async fn sync(root: &Path, mut options: SyncOptions) -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let update_engine = Engine {
+        #[cfg(test)]
+        mock_rpc: None,
         client: client.clone(),
         session: session.clone(),
         archive: archive.clone(),
@@ -446,7 +460,7 @@ pub async fn sync(root: &Path, mut options: SyncOptions) -> Result<()> {
         },
         &json!({"failed":failed_media}),
     )?;
-    let incomplete:i64=archive.db.query_row("SELECT COUNT(*) FROM coverage WHERE status IN ('incomplete','failed_or_inaccessible','recovery_error','waiting_or_failed')",[],|r|r.get(0))?;
+    let incomplete:i64=archive.db.query_row("SELECT COUNT(*) FROM coverage WHERE status IN ('incomplete','failed_or_inaccessible','recovery_error','waiting_or_failed','inaccessible','limited','unsupported','requires_takeout','not_started','in_progress')",[],|r|r.get(0))?;
     let status = if update_failed || stop_reason == "error" {
         "failed"
     } else if stop_reason != "exhausted" {
@@ -517,6 +531,21 @@ impl Engine {
         dc: Option<i32>,
     ) -> Result<(String, Vec<u8>, Value)> {
         self.check_stop()?;
+        #[cfg(test)]
+        if let Some(queue) = &self.mock_rpc {
+            let expected = queue.lock().unwrap().pop_front().expect("unexpected RPC");
+            assert_eq!(name, expected.method);
+            assert_eq!(args, expected.args);
+            assert_eq!(dc, expected.dc);
+            let (_, root) = self.schema.request(name, args)?;
+            let value = expected.result.map_err(anyhow::Error::msg)?;
+            let bytes = self.schema.encode(&root, &value)?;
+            return Ok((
+                root.clone(),
+                bytes.clone(),
+                self.schema.decode(&root, &bytes)?,
+            ));
+        }
         let (mut bytes, root) = self.schema.request(name, args)?;
         let mut dc = dc;
         if let Some(range) = range {
@@ -648,7 +677,15 @@ impl Engine {
         }
         let selector = Selector::parse(&archive.config.history_selector)?;
         let attachment_selector = Selector::parse(&archive.config.attachment_selector)?;
-        let excluded: Vec<(usize, usize, bool)> = if matches!(source, "live" | "history") {
+        let excluded: Vec<(usize, usize, bool)> = if matches!(
+            source,
+            "live"
+                | "history"
+                | "messages.searchGlobal"
+                | "messages.getRecentLocations"
+                | "messages.getScheduledHistory"
+                | "messages.getScheduledMessages"
+        ) {
             slices
                 .iter()
                 .filter(|s| s.root == "Message")
@@ -657,7 +694,9 @@ impl Engine {
                         .and_then(|p| peer_metadata(&archive, &p).ok().flatten())
                         .unwrap_or(json!({}));
                     let meta = message_context(&meta, &s.value);
-                    (!selector.matches(&meta)).then(|| {
+                    let outside_call_range = source == "messages.searchGlobal"
+                        && extra::outside_call_bounds(&self.options, &s.value);
+                    (!selector.matches(&meta) || outside_call_range).then(|| {
                         (
                             s.offset,
                             s.offset + s.length,
@@ -674,7 +713,12 @@ impl Engine {
         if excluded.is_empty() {
             records.push(Capture {
                 key: format!("{root}:{scope}"),
-                kind: if root == "Update" { "update" } else { "rpc" }.into(),
+                kind: if root == "Update" {
+                    "update"
+                } else {
+                    extra::envelope_kind(source)
+                }
+                .into(),
                 root_type: root.into(),
                 bytes: bytes.to_vec(),
                 observed_at: at,
@@ -714,24 +758,67 @@ impl Engine {
             } else {
                 None
             };
-            let inferred = identity(&slice.root, v, owner_scope.as_deref().unwrap_or(scope));
-            let Some((key, kind)) = inferred else {
-                continue;
-            };
-            if !unique.insert((
-                key.clone(),
-                blake3::hash(&bytes[slice.offset..slice.offset + slice.length]),
-            )) {
-                continue;
-            }
             let containing_message = slices.iter().find(|parent| {
                 parent.root == "Message"
                     && parent.offset <= slice.offset
                     && parent.offset + parent.length >= slice.offset + slice.length
             });
+            let message_scope = containing_message.map(|parent| {
+                let scheduled = slices.iter().any(|update| {
+                    update.value["_"] == "updateNewScheduledMessage"
+                        && update.offset <= parent.offset
+                        && update.offset + update.length >= parent.offset + parent.length
+                });
+                let shortcut_scope = if source == "messages.getQuickReplies" {
+                    value["quick_replies"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|reply| reply["top_message"] == parent.value["id"])
+                        .and_then(|reply| integer(&reply["shortcut_id"]))
+                        .map(|id| format!("account/quick_reply:{id}"))
+                } else {
+                    None
+                };
+                extra::message_scope(
+                    &parent.value,
+                    source,
+                    shortcut_scope.as_deref().unwrap_or(scope),
+                    scheduled,
+                )
+            });
+            let parent_identity = containing_message.and_then(|parent| {
+                identity(
+                    "Message",
+                    &parent.value,
+                    message_scope.as_deref().unwrap_or(scope),
+                )
+            });
+            let inferred = parent_identity
+                .as_ref()
+                .and_then(|(key, _)| extra::message_child_identity(&slice.root, v, key))
+                .or_else(|| {
+                    identity(
+                        &slice.root,
+                        v,
+                        if slice.root == "Message" {
+                            message_scope.as_deref().unwrap_or(scope)
+                        } else {
+                            owner_scope.as_deref().unwrap_or(scope)
+                        },
+                    )
+                });
+            let Some((mut key, kind)) = inferred else {
+                continue;
+            };
+
             let mut metadata = scope
                 .split('/')
-                .next()
+                .find(|part| {
+                    part.starts_with("user:")
+                        || part.starts_with("chat:")
+                        || part.starts_with("channel:")
+                })
                 .map(|key| peer_metadata(&archive, key))
                 .transpose()?
                 .flatten()
@@ -750,6 +837,85 @@ impl Engine {
                 metadata["sender"] =
                     peer_key(&parent.value["from_id"]).map_or(Value::Null, Value::String);
             }
+            if let Some((message_key, message_kind)) = &parent_identity {
+                metadata["message_key"] = json!(message_key);
+                metadata["message_kind"] = json!(message_kind);
+                if let Some(parent) = containing_message {
+                    metadata["quick_reply_shortcut_id"] =
+                        parent.value["quick_reply_shortcut_id"].clone();
+                    if metadata["quick_reply_shortcut_id"].is_null()
+                        && let Some(shortcut) = message_scope
+                            .as_deref()
+                            .and_then(|s| s.strip_prefix("account/quick_reply:"))
+                    {
+                        metadata["quick_reply_shortcut_id"] = json!(shortcut);
+                    }
+                }
+            }
+            if let Some(story) = slices
+                .iter()
+                .filter(|parent| {
+                    parent.root == "StoryItem"
+                        && parent.offset <= slice.offset
+                        && parent.offset + parent.length >= slice.offset + slice.length
+                })
+                .min_by_key(|p| p.length)
+            {
+                let peer = slices
+                    .iter()
+                    .filter(|parent| {
+                        parent.offset <= story.offset
+                            && parent.offset + parent.length >= story.offset + story.length
+                    })
+                    .filter_map(|parent| match parent.root.as_str() {
+                        "PeerStories" | "Update" => peer_key(&parent.value["peer"]),
+                        "StoryView" | "StoryReaction" => peer_key(&parent.value["peer_id"]),
+                        _ => None,
+                    })
+                    .next()
+                    .or_else(|| {
+                        scope
+                            .split('/')
+                            .find(|s| s.starts_with("user:") || s.starts_with("channel:"))
+                            .map(str::to_owned)
+                    })
+                    .or_else(|| {
+                        scope
+                            .starts_with("own_stories")
+                            .then(|| format!("user:{self_id}"))
+                    });
+                if let Some(peer) = &peer {
+                    if slice.root == "StoryItem" {
+                        key = format!("{peer}/story:{}", integer(&v["id"]).context("story ID")?);
+                    }
+                    metadata["peer"] = json!(peer);
+                }
+                metadata["story_peer"] = json!(peer);
+                metadata["story_id"] = story.value["id"].clone();
+            }
+            for parent in slices.iter().filter(|parent| {
+                parent.offset <= slice.offset
+                    && parent.offset + parent.length >= slice.offset + slice.length
+            }) {
+                if parent.root == "StarGift" && parent.value["slug"].is_string() {
+                    metadata["gift_slug"] = parent.value["slug"].clone();
+                }
+                if parent.root == "SavedStarGift" {
+                    if let Some(id) = integer(&parent.value["saved_id"]) {
+                        if let Some(peer) = scope.split('/').find(|s| s.starts_with("channel:")) {
+                            let input: String = archive.db.query_row(
+                                "SELECT input FROM peers WHERE key=?1",
+                                [peer],
+                                |r| r.get(0),
+                            )?;
+                            metadata["saved_gift_reference"] = json!({"_":"inputSavedStarGiftChat","peer":serde_json::from_str::<Value>(&input)?,"saved_id":id.to_string()});
+                        }
+                    } else if let Some(id) = integer(&parent.value["msg_id"]) {
+                        metadata["saved_gift_reference"] =
+                            json!({"_":"inputSavedStarGiftUser","msg_id":id});
+                    }
+                }
+            }
             merge(
                 &mut metadata,
                 &json!({"id":v.get("id").map(|v|integer(v).map(|x|x.to_string()).unwrap_or_else(||v.to_string())),"scope":scope}),
@@ -759,6 +925,13 @@ impl Engine {
                 if let Some(m) = peer_metadata(&archive, &peer)? {
                     merge(&mut metadata, &m);
                 }
+            }
+            if slice.root == "StarsTransaction" {
+                if let Some(peer) = peer_key(&v["peer"]["peer"]) {
+                    metadata["peer"] = json!(peer);
+                }
+                metadata["message_id"] = v["msg_id"].clone();
+                metadata["date"] = v["date"].clone();
             }
             if slice.root == "Message" {
                 metadata["id"] = json!(integer(&v["id"]).map(|id| id.to_string()));
@@ -774,11 +947,24 @@ impl Engine {
                         * 1_000_000
                 );
             }
+            if matches!(kind.as_str(), "scheduled_message" | "quick_reply_message") {
+                metadata["revision"] = json!(
+                    checkpoint
+                        .and_then(|(_, progress)| integer(&progress["snapshot_revision"]))
+                        .unwrap_or(at)
+                );
+            }
             if slice.root == "User" || slice.root == "Chat" {
                 cache_peer(&archive, v, self_id)?;
                 if let Some(m) = peer_metadata(&archive, &key)? {
                     merge(&mut metadata, &m);
                 }
+            }
+            if !unique.insert((
+                key.clone(),
+                blake3::hash(&bytes[slice.offset..slice.offset + slice.length]),
+            )) {
+                continue;
             }
             let index = records.len();
             records.push(Capture {
@@ -823,7 +1009,16 @@ impl Engine {
                     params![key, meta.to_string()],
                 )?;
             }
-            deletion_records(&archive, &value, bytes, at, replay, &mut records)?;
+        }
+        for update in slices.iter().filter(|s| s.root == "Update") {
+            deletion_records(
+                &archive,
+                &update.value,
+                &bytes[update.offset..update.offset + update.length],
+                at,
+                replay,
+                &mut records,
+            )?;
         }
         let ids = archive.ingest(&self.schema_hash, &records, checkpoint)?;
         for (index, v) in media {
@@ -855,6 +1050,7 @@ impl Engine {
                 Ok(Some(v))
             }
             Err(e) => {
+                self.check_stop()?;
                 self.archive.lock().unwrap().coverage(
                     scope,
                     "failed_or_inaccessible",
@@ -885,11 +1081,14 @@ impl Engine {
                 .unwrap()
                 .db
                 .execute("UPDATE media SET retry_at=0 WHERE status='deferred'", [])?;
+            self.prepare_extra_coverage()?;
             self.progress("account_collectors", 0, None)?;
             self.account_collectors().await?;
             self.dialogs().await?;
             self.refresh_folders()?;
+            self.extra_account_collectors().await?;
             let peers = self.peer_list()?;
+            self.prepare_extra_peers(&peers)?;
             let total = peers.len() as u64;
             for (index, (key, input, metadata, raw)) in peers.into_iter().enumerate() {
                 self.progress("history", index as u64, Some(total))?;
@@ -902,6 +1101,7 @@ impl Engine {
                     continue;
                 }
                 self.peer_collectors(&key, &input, &raw).await?;
+                self.extra_peer_collectors(&key, &input, &raw).await?;
                 if let Err(e) = self.history(&key, &input).await {
                     self.archive.lock().unwrap().coverage(
                         &format!("history:{key}"),
@@ -915,6 +1115,8 @@ impl Engine {
                     return Ok(());
                 }
             }
+            self.extra_enrichment().await?;
+            self.finish_extra_coverage()?;
             self.download_pending().await?;
             {
                 let a = self.archive.lock().unwrap();
@@ -1549,7 +1751,7 @@ impl Engine {
             None,
         )
         .await?;
-        self.paged("contacts.getTopPeers",json!({"correspondents":true,"bots_pm":true,"bots_inline":true,"phone_calls":true,"forward_users":true,"forward_chats":true,"groups":true,"channels":true,"offset":0,"limit":100,"hash":"0"}),"top_peers","categories","offset",None).await?;
+        self.paged("contacts.getTopPeers",json!({"correspondents":true,"bots_pm":true,"bots_inline":true,"phone_calls":true,"forward_users":true,"forward_chats":true,"groups":true,"channels":true,"bots_app":true,"bots_guestchat":true,"offset":0,"limit":100,"hash":"0"}),"top_peers","categories","offset",None).await?;
         self.paged(
             "photos.getUserPhotos",
             json!({"user_id":{"_":"inputUserSelf"},"offset":0,"max_id":"0","limit":100}),
@@ -1578,8 +1780,7 @@ impl Engine {
         )
         .await?;
         if self.takeout.is_some() {
-            self.collect("contacts.getSaved", json!({}), "saved_contacts")
-                .await?;
+            self.extra_saved_contacts().await?;
             self.paged(
                 "channels.getLeftChannels",
                 json!({"offset":0}),
@@ -1645,6 +1846,7 @@ impl Engine {
             let (root, bytes, v) = match response {
                 Ok(r) => r,
                 Err(e) => {
+                    self.check_stop()?;
                     self.archive.lock().unwrap().coverage(
                         scope,
                         "failed_or_inaccessible",
@@ -1677,7 +1879,7 @@ impl Engine {
                 &root,
                 &bytes,
                 method,
-                Some(scope),
+                Some(&extra::page_scope(scope, &args)),
                 None,
                 Some((&key, &progress)),
             )?;
@@ -1993,6 +2195,13 @@ impl Engine {
         };
         for ctx in contexts {
             let ctx: Value = serde_json::from_str(&ctx)?;
+            if self.refresh_extra_media(&ctx).await? {
+                self.archive.lock().unwrap().db.execute(
+                    "UPDATE media SET retry_at=strftime('%s','now')+5 WHERE id=?1",
+                    [id],
+                )?;
+                return Ok(());
+            }
             let Some(peer) = ctx["peer"].as_str() else {
                 continue;
             };
@@ -2000,7 +2209,17 @@ impl Engine {
                 continue;
             };
             let input = self.input_peer(peer)?;
-            let (method, args) = if peer.starts_with("channel:") {
+            let (method, args) = if ctx["message_kind"] == "scheduled_message" {
+                (
+                    "messages.getScheduledMessages",
+                    json!({"peer":input,"id":[message]}),
+                )
+            } else if ctx["message_kind"] == "quick_reply_message" {
+                (
+                    "messages.getQuickReplyMessages",
+                    json!({"shortcut_id":ctx["quick_reply_shortcut_id"],"id":[message],"hash":"0"}),
+                )
+            } else if peer.starts_with("channel:") {
                 (
                     "channels.getMessages",
                     json!({"channel":{"_":"inputChannel","channel_id":input["channel_id"],"access_hash":input["access_hash"]},"id":[{"_":"inputMessageID","id":message}]}),
@@ -2011,7 +2230,16 @@ impl Engine {
                     json!({"id":[{"_":"inputMessageID","id":message}]}),
                 )
             };
-            if self.collect(method, args, peer).await?.is_some() {
+            let scope = if ctx["message_kind"] == "quick_reply_message" {
+                format!(
+                    "account/quick_reply:{}",
+                    integer(&ctx["quick_reply_shortcut_id"])
+                        .context("missing quick reply shortcut")?
+                )
+            } else {
+                peer.to_string()
+            };
+            if self.collect(method, args, &scope).await?.is_some() {
                 self.archive.lock().unwrap().db.execute(
                     "UPDATE media SET retry_at=strftime('%s','now')+5 WHERE id=?1",
                     [id],
@@ -2125,6 +2353,15 @@ fn cache_peer(a: &Archive, v: &Value, self_id: i64) -> Result<()> {
 }
 fn identity(root: &str, v: &Value, scope: &str) -> Option<(String, String)> {
     let name = v["_"].as_str()?;
+    if root == "Message"
+        && let Some(identity) = extra::message_identity(v, scope)
+    {
+        return Some(identity);
+    }
+    if let Some(identity) = extra::object_identity(root, v, scope) {
+        return Some(identity);
+    }
+    let scope = scope.split("/page:").next().unwrap_or(scope);
     let id = integer(&v["id"]);
     Some(match root {
         "User" => (format!("user:{}", id?), "user".into()),
@@ -2221,9 +2458,41 @@ fn deletion_records(
     records: &mut Vec<Capture>,
 ) -> Result<()> {
     let constructor = v["_"].as_str().unwrap_or("");
+    if constructor == "updateDeleteQuickReply" {
+        let shortcut = integer(&v["shortcut_id"]).context("deleted shortcut ID")?;
+        let prefix = format!("account/quick_reply:{shortcut}/message:");
+        let mut targets: Vec<(String, String)> = a.db.prepare("SELECT h.key,o.kind FROM heads h JOIN observations o ON o.id=h.observation WHERE o.kind='quick_reply_message' AND substr(h.key,1,length(?1))=?1")?
+            .query_map([prefix], |r| Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        targets.push(
+            extra::object_identity(
+                "QuickReply",
+                &json!({"_":"quickReply","shortcut_id":shortcut}),
+                "account",
+            )
+            .context("shortcut identity")?,
+        );
+        for (key, kind) in targets {
+            records.push(Capture {
+                key: key.clone(),
+                kind,
+                root_type: "Update".into(),
+                bytes: bytes.to_vec(),
+                observed_at: at,
+                source: "authoritative_deletion".into(),
+                metadata: json!({"quick_reply_shortcut_id":shortcut,"revision":at}),
+                replay_key: replay.map(|r| format!("{r}:delete:{key}")),
+                partial: false,
+                deleted: true,
+            });
+        }
+        return Ok(());
+    }
     if !matches!(
         constructor,
-        "updateDeleteMessages" | "updateDeleteChannelMessages"
+        "updateDeleteMessages"
+            | "updateDeleteChannelMessages"
+            | "updateDeleteScheduledMessages"
+            | "updateDeleteQuickReplyMessages"
     ) {
         return Ok(());
     }
@@ -2233,12 +2502,17 @@ fn deletion_records(
         .flatten()
         .filter_map(integer)
     {
-        let key = if let Some(channel) = integer(&v["channel_id"]) {
+        let key = if constructor == "updateDeleteScheduledMessages" {
+            peer_key(&v["peer"]).map(|peer| format!("{peer}/scheduled_message:{id}"))
+        } else if constructor == "updateDeleteQuickReplyMessages" {
+            integer(&v["shortcut_id"])
+                .map(|shortcut| format!("account/quick_reply:{shortcut}/message:{id}"))
+        } else if let Some(channel) = integer(&v["channel_id"]) {
             Some(format!("channel:{channel}/message:{id}"))
         } else {
             let keys: Vec<String> = a
                 .db
-                .prepare("SELECT key FROM heads WHERE key LIKE ?1 AND key NOT LIKE 'channel:%'")?
+                .prepare("SELECT h.key FROM heads h JOIN observations o ON o.id=h.observation WHERE o.kind='message' AND h.key LIKE ?1 AND h.key NOT LIKE 'channel:%'")?
                 .query_map([format!("%/message:{id}")], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?;
             if keys.len() == 1 {
@@ -2251,7 +2525,11 @@ fn deletion_records(
             key: key.clone().unwrap_or_else(|| {
                 format!("unresolved-delete:{id}:{}", blake3::hash(bytes).to_hex())
             }),
-            kind: if key.is_some() {
+            kind: if constructor == "updateDeleteScheduledMessages" && key.is_some() {
+                "scheduled_message"
+            } else if constructor == "updateDeleteQuickReplyMessages" && key.is_some() {
+                "quick_reply_message"
+            } else if key.is_some() {
                 "message"
             } else {
                 "unresolved_deletion"
@@ -2356,7 +2634,7 @@ mod tests {
     use super::*;
     use crate::{config::Config, query::Query};
 
-    async fn fixture(root: &Path, config: Config) -> Engine {
+    pub(super) async fn fixture(root: &Path, config: Config) -> Engine {
         let a = Archive::init(root, &config).unwrap();
         a.db.execute_batch("CREATE TABLE peers(key TEXT PRIMARY KEY,input TEXT,metadata TEXT,raw TEXT); CREATE TABLE folders(id TEXT PRIMARY KEY,data TEXT);").unwrap();
         a.set_checkpoint("account_id", &json!(1)).unwrap();
@@ -2374,6 +2652,7 @@ mod tests {
         );
         let SenderPool { handle, .. } = SenderPool::new(session.clone(), 1);
         Engine {
+            mock_rpc: None,
             client: Client::new(handle),
             session,
             archive: Arc::new(Mutex::new(a)),
@@ -2388,7 +2667,7 @@ mod tests {
             stop: Default::default(),
         }
     }
-    fn message() -> Value {
+    pub(super) fn message() -> Value {
         json!({"_":"message","id":17,"peer_id":{"_":"peerUser","user_id":"42"},"date":1700000000,"message":"private text","media":{"_":"messageMediaPhoto","photo":{"_":"photo","id":"123","access_hash":"456","file_reference":{"$bytes":"abcd"},"date":1700000000,"sizes":[{"_":"photoSize","type":"x","w":100,"h":100,"size":4}],"dc_id":2}}})
     }
     #[tokio::test]
