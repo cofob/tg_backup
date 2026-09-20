@@ -224,7 +224,7 @@ cargo test --test archive_v2 synthetic_archive_storage_report -- --ignored --noc
 
 `status --details` reports compressed payloads, dictionaries, deduplicated media bytes, and SQLite page usage by table/index. The 10,000-message synthetic fixture measured 6,876,000 raw TL bytes compressed to 51,319 bytes, with a 7,520,256-byte catalog and 4,481,024-byte epoch database. These are synthetic figures, not expected ratios for real accounts; metadata/index overhead is currently much larger than compressed payloads. Archive scans and compression use bounded batches. Grammers currently uses an unbounded live update queue to avoid dropping updates; sustained ingestion lag can grow memory, so that transport path still needs production load validation.
 
-The Docker image contains both Rust binaries and runs as an unprivileged user. Mount a writable dataset directory at `/data`. GitHub Actions checks Linux/macOS and retains the repository's container publishing workflow.
+The Docker image contains both Rust binaries and defaults to the unprivileged numeric identity `10001:10001`. Mount a dataset directory writable by that identity at `/data`. GitHub Actions checks Linux/macOS and retains the repository's container publishing workflow.
 
 
 ## Guided setup and continuous operation
@@ -322,7 +322,7 @@ docker compose run --rm setup
 docker compose up -d
 ```
 
-Compose runs an unprivileged coordinator and a separate FFmpeg worker capped at two CPUs/2 GiB. Set `TG_BACKUP_WORKER_CPUS` and `TG_BACKUP_WORKER_MEMORY` to adjust container limits alongside the configuration budget. A mode-0600 Unix socket carries private worker requests; no Docker socket is mounted. Both services share persistent archive data, and `/etc/localtime` supplies the host timezone. Core and `-ffmpeg` images support Linux AMD64/ARM64. For local builds use `docker compose build` first.
+Compose enforces UID/GID `10001:10001`, drops all Linux capabilities, enables `no-new-privileges`, and uses a read-only root filesystem with a private temporary filesystem. The coordinator and separate FFmpeg worker share writable archive/control volumes; the worker is capped at two CPUs/2 GiB. Set `TG_BACKUP_WORKER_CPUS` and `TG_BACKUP_WORKER_MEMORY` to adjust container limits alongside the configuration budget. A mode-0600 Unix socket carries private worker requests; no Docker socket is mounted. `/etc/localtime` supplies the host timezone. Core and `-ffmpeg` images support Linux AMD64/ARM64. For local builds use `docker compose build` first.
 
 API and metrics bind localhost by default. To access them through published container ports, configure `api_bind = "0.0.0.0:8080"` with `api_token`, and optionally `metrics_bind = "0.0.0.0:9090"`. Published host ports remain loopback-only in the example. A token reference has the form `api_token = { provider = "file", path = "/data/archive/api.token" }`. Set file permissions to 0600. `TG_BACKUP_HTTP_TOKEN_FILE` and `TG_BACKUP_METRICS_TOKEN_FILE` are also supported for mounted private secrets.
 

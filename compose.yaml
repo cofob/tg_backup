@@ -1,6 +1,16 @@
 name: tg-backup
+x-rootless: &rootless
+  user: "10001:10001"
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=64m
 services:
   setup:
+    <<: *rootless
     image: ghcr.io/cofob/tg-backup:latest
     build:
       context: .
@@ -13,6 +23,7 @@ services:
       - archive:/data
       - /etc/localtime:/etc/localtime:ro
   coordinator:
+    <<: *rootless
     image: ghcr.io/cofob/tg-backup:latest
     build:
       context: .
@@ -39,6 +50,7 @@ services:
       timeout: 10s
       start_period: 20s
   worker:
+    <<: *rootless
     image: ghcr.io/cofob/tg-backup:latest-ffmpeg
     build:
       context: .
