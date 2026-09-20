@@ -50,7 +50,7 @@ jobs:
           cache-from: |
             type=gha,scope=${{ matrix.arch }}-core
             type=gha,scope=${{ matrix.arch }}-ffmpeg
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}-core
+          cache-to: type=gha,mode=min,scope=${{ matrix.arch }}-core
       - name: Save core digest
         env:
           DIGEST: ${{ steps.core.outputs.digest }}
@@ -79,7 +79,7 @@ jobs:
           cache-from: |
             type=gha,scope=${{ matrix.arch }}-core
             type=gha,scope=${{ matrix.arch }}-ffmpeg
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}-ffmpeg
+          cache-to: type=gha,mode=min,scope=${{ matrix.arch }}-ffmpeg
       - name: Smoke-test the exact FFmpeg image
         env:
           DIGEST: ${{ steps.ffmpeg.outputs.digest }}

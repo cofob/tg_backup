@@ -158,6 +158,8 @@ jobs:
           load: true
           tags: tg-backup:smoke
           cache-from: type=gha,scope=amd64-ffmpeg
-          cache-to: type=gha,mode=max,scope=amd64-ffmpeg
+          # The Dockerfile has one source build layer; min avoids uploading a large
+          # intermediate cache that cannot survive source changes anyway.
+          cache-to: type=gha,mode=min,scope=amd64-ffmpeg
       - run: ci/container-smoke.sh
       - run: docker compose config --quiet
