@@ -470,7 +470,7 @@ pub async fn sync(root: &Path, mut options: SyncOptions) -> Result<()> {
     } else {
         "complete"
     };
-    archive.db.execute("UPDATE jobs SET status=?2,updated=?3,details=?4 WHERE id=?1",params![job,status,now(),json!({"stop_reason":stop_reason,"result":result.as_ref().err().map(ToString::to_string),"resume":format!("tg-backup sync --resume {job}")}).to_string()])?;
+    archive.db.execute("UPDATE jobs SET status=?2,updated=?3,details=json_patch(details,?4) WHERE id=?1",params![job,status,now(),json!({"stop_reason":stop_reason,"result":result.as_ref().err().map(ToString::to_string),"resume":format!("tg-backup sync --resume {job}")}).to_string()])?;
     result
 }
 fn encode_state(s: &UpdatesState) -> Value {
@@ -498,13 +498,17 @@ fn decode_state(v: &Value) -> Result<UpdatesState> {
 impl Engine {
     fn progress(&self, phase: &str, peers_done: u64, peers_total: Option<u64>) -> Result<()> {
         let a = self.archive.lock().unwrap();
+        a.db.execute(
+            "UPDATE jobs SET details=json_set(details,'$.requests_finished',0,'$.requests_failed',0,'$.active_method',NULL) WHERE id=?1 AND COALESCE(json_extract(details,'$.phase'),'') != ?2",
+            params![self.job, phase],
+        )?;
         let messages = a
             .checkpoint(&format!("messages:{}", self.job))?
             .unwrap_or(json!(0));
         let media = a
             .checkpoint(&format!("media_bytes:{}", self.job))?
             .unwrap_or(json!(0));
-        a.db.execute("UPDATE jobs SET updated=?2,details=?3 WHERE id=?1",params![self.job,now(),json!({"phase":phase,"peers_visited":peers_done,"peers_discovered":peers_total,"messages_scanned":messages,"media_bytes":media,"elapsed_seconds":self.started.elapsed().as_secs(),"continuous":self.options.continuous,"total_messages":null}).to_string()])?;
+        a.db.execute("UPDATE jobs SET updated=?2,details=json_set(json_patch(details,?3),'$.peers_discovered',json_extract(?3,'$.peers_discovered'),'$.total_messages',NULL) WHERE id=?1",params![self.job,now(),json!({"phase":phase,"peers_visited":peers_done,"peers_discovered":peers_total,"messages_scanned":messages,"media_bytes":media,"elapsed_seconds":self.started.elapsed().as_secs(),"continuous":self.options.continuous,"total_messages":null}).to_string()])?;
         Ok(())
     }
     fn check_stop(&self) -> Result<()> {
@@ -524,6 +528,40 @@ impl Engine {
         Ok(())
     }
     async fn rpc(
+        &self,
+        name: &str,
+        args: Value,
+        range: Option<&Value>,
+        dc: Option<i32>,
+    ) -> Result<(String, Vec<u8>, Value)> {
+        self.check_stop()?;
+        self.rpc_progress(Some(name), false, false)?;
+        let result = self.rpc_inner(name, args, range, dc).await;
+        self.rpc_progress(None, true, result.is_err())?;
+        result
+    }
+
+    // Count logical requests (including each pagination request), not retry attempts.
+    fn rpc_progress(&self, method: Option<&str>, finished: bool, failed: bool) -> Result<()> {
+        let a = self.archive.lock().unwrap();
+        let messages = a
+            .checkpoint(&format!("messages:{}", self.job))?
+            .unwrap_or(json!(0));
+        let media = a
+            .checkpoint(&format!("media_bytes:{}", self.job))?
+            .unwrap_or(json!(0));
+        a.db.execute(
+            "UPDATE jobs SET updated=?2,details=json_set(details,
+             '$.active_method',?3,
+             '$.requests_finished',COALESCE(json_extract(details,'$.requests_finished'),0)+?4,
+             '$.requests_failed',COALESCE(json_extract(details,'$.requests_failed'),0)+?5,
+             '$.elapsed_seconds',?6,'$.messages_scanned',json(?7),'$.media_bytes',json(?8)) WHERE id=?1",
+            params![self.job, now(), method, u64::from(finished), u64::from(failed), self.started.elapsed().as_secs(), messages.to_string(), media.to_string()],
+        )?;
+        Ok(())
+    }
+
+    async fn rpc_inner(
         &self,
         name: &str,
         args: Value,
@@ -1063,6 +1101,7 @@ impl Engine {
     }
     async fn run(&mut self) -> Result<()> {
         if self.options.takeout {
+            self.progress("takeout_preparation", 0, None)?;
             self.collect(
                 "messages.getDialogFilters",
                 json!({}),
@@ -1071,27 +1110,34 @@ impl Engine {
             .await?;
             self.dialogs().await?;
             self.refresh_folders()?;
+            self.progress("takeout_initialization", 0, None)?;
             self.start_takeout().await?;
         }
         loop {
             self.check_stop()?;
+            self.progress("media_reconciliation", 0, None)?;
             self.reconcile_media()?;
             self.archive
                 .lock()
                 .unwrap()
                 .db
                 .execute("UPDATE media SET retry_at=0 WHERE status='deferred'", [])?;
+            self.progress("coverage_preparation", 0, None)?;
             self.prepare_extra_coverage()?;
             self.progress("account_collectors", 0, None)?;
             self.account_collectors().await?;
+            self.progress("dialogs", 0, None)?;
             self.dialogs().await?;
+            self.progress("folders", 0, None)?;
             self.refresh_folders()?;
+            self.progress("extra_account_collectors", 0, None)?;
             self.extra_account_collectors().await?;
+            self.progress("peer_preparation", 0, None)?;
             let peers = self.peer_list()?;
             self.prepare_extra_peers(&peers)?;
             let total = peers.len() as u64;
             for (index, (key, input, metadata, raw)) in peers.into_iter().enumerate() {
-                self.progress("history", index as u64, Some(total))?;
+                self.progress("peer_selection", index as u64, Some(total))?;
                 self.check_stop()?;
                 let selected = {
                     let a = self.archive.lock().unwrap();
@@ -1100,8 +1146,11 @@ impl Engine {
                 if !selected {
                     continue;
                 }
+                self.progress("peer_collectors", index as u64, Some(total))?;
                 self.peer_collectors(&key, &input, &raw).await?;
+                self.progress("extra_peer_collectors", index as u64, Some(total))?;
                 self.extra_peer_collectors(&key, &input, &raw).await?;
+                self.progress("history", index as u64, Some(total))?;
                 if let Err(e) = self.history(&key, &input).await {
                     self.archive.lock().unwrap().coverage(
                         &format!("history:{key}"),
@@ -1110,14 +1159,20 @@ impl Engine {
                     )?;
                     tracing::warn!(peer=key,error=%e,"history incomplete");
                 }
+                self.progress("media", index as u64 + 1, Some(total))?;
                 self.download_pending().await?;
+                self.progress("media", index as u64 + 1, Some(total))?;
                 if self.message_limit()? {
                     return Ok(());
                 }
             }
+            self.progress("enrichment", total, Some(total))?;
             self.extra_enrichment().await?;
+            self.progress("coverage_finalization", total, Some(total))?;
             self.finish_extra_coverage()?;
+            self.progress("media", total, Some(total))?;
             self.download_pending().await?;
+            self.progress("finalization", total, Some(total))?;
             {
                 let a = self.archive.lock().unwrap();
                 let current = a.config.epoch.key(Utc::now());
@@ -1142,10 +1197,12 @@ impl Engine {
                     (pending, paused)
                 };
                 if self.takeout.is_some() && pending == 0 && !paused {
+                    self.progress("takeout_finalization", total, Some(total))?;
                     self.finish_takeout(true).await?;
                 }
                 break;
             }
+            self.progress("waiting", total, Some(total))?;
             let wait = self.archive.lock().unwrap().config.metadata_refresh_seconds;
             tokio::select! {_=self.stop.cancelled()=>break,_=tokio::time::sleep(Duration::from_secs(wait))=>{}}
         }
@@ -2667,6 +2724,72 @@ mod tests {
             stop: Default::default(),
         }
     }
+    #[tokio::test]
+    async fn progress_tracks_requests_and_resets_only_on_phase_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fixture(dir.path(), Config::default()).await;
+        e.mock_rpc = Some(Mutex::new(std::collections::VecDeque::from([
+            MockReply {
+                method: "account.getAccountTTL",
+                args: json!({}),
+                dc: None,
+                result: Ok(json!({"_":"accountDaysTTL","days":365})),
+            },
+            MockReply {
+                method: "account.getAccountTTL",
+                args: json!({}),
+                dc: None,
+                result: Err("collector unavailable".into()),
+            },
+        ])));
+        e.archive
+            .lock()
+            .unwrap()
+            .db
+            .execute(
+                "INSERT INTO jobs VALUES('fixture','{}','running',0,0,'{}')",
+                [],
+            )
+            .unwrap();
+        let details = || -> Value {
+            let a = e.archive.lock().unwrap();
+            let text: String =
+                a.db.query_row("SELECT details FROM jobs WHERE id='fixture'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            serde_json::from_str(&text).unwrap()
+        };
+        e.progress("account_collectors", 0, None).unwrap();
+        e.rpc_progress(Some("contacts.getContacts"), false, false)
+            .unwrap();
+        assert_eq!(details()["active_method"], "contacts.getContacts");
+        assert_eq!(details()["requests_finished"], 0);
+        e.rpc("account.getAccountTTL", json!({}), None, None)
+            .await
+            .unwrap();
+        assert!(
+            e.rpc("account.getAccountTTL", json!({}), None, None)
+                .await
+                .is_err()
+        );
+        e.progress("account_collectors", 0, None).unwrap();
+        assert_eq!(details()["requests_finished"], 2);
+        assert_eq!(details()["requests_failed"], 1);
+        assert!(details()["active_method"].is_null());
+        e.archive
+            .lock()
+            .unwrap()
+            .set_checkpoint("messages:fixture", &json!(42))
+            .unwrap();
+        e.progress("history", 1, Some(2)).unwrap();
+        assert_eq!(details()["requests_finished"], 0);
+        assert_eq!(details()["requests_failed"], 0);
+        assert_eq!(details()["messages_scanned"], 42);
+        assert_eq!(details()["peers_visited"], 1);
+        assert_eq!(details()["peers_discovered"], 2);
+    }
+
     pub(super) fn message() -> Value {
         json!({"_":"message","id":17,"peer_id":{"_":"peerUser","user_id":"42"},"date":1700000000,"message":"private text","media":{"_":"messageMediaPhoto","photo":{"_":"photo","id":"123","access_hash":"456","file_reference":{"$bytes":"abcd"},"date":1700000000,"sizes":[{"_":"photoSize","type":"x","w":100,"h":100,"size":4}],"dc_id":2}}})
     }
