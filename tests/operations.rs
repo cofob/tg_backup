@@ -214,7 +214,7 @@ fn historical_selection_requires_all_shared_references() {
     for (n, id) in ids.into_iter().enumerate() {
         let key = n.to_string();
         a.queue_media(&key, &json!({}), 1, Some(3), id).unwrap();
-        a.append_media(&key, 0, b"abc").unwrap();
+        a.append_media(&key, 0, &[0xff, 0xd8, 0xff]).unwrap();
         a.finish_media(&key).unwrap();
     }
     let p = tg_backup::transcode::Policy {

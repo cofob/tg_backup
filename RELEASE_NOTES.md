@@ -1,16 +1,16 @@
-# tg_backup 2.2.0
+# tg_backup 2.3.0
 
-Expanded read-only Telegram exports with resumable collection and explicit coverage reporting.
+Recover cross-datacenter downloads, avoid unsupported media conversions, and retry failed work without discarding completed data.
 
-- Collect call history, Stars balances and transactions, subscriptions, available payment receipts, saved payment information, gifts and collectibles, boosts, business settings and quick replies, channel statistics, shared locations, story viewers and reactions, and available bot/mini-app metadata.
-- Export scheduled messages as a separate dataset. Ordinary messages, scheduled messages and quick replies use distinct identities; updates, deletions and complete schedule-queue snapshots preserve retained history without mixing these namespaces.
-- Preserve every response page and atomically checkpoint pagination. Resume interrupted lists, detect repeated cursors, and retain exact native TL payloads and attachment references.
-- Load channel statistics and asynchronous graphs from the appropriate datacenter. Refresh scheduled, quick-reply, story and gift attachment references through their original APIs.
-- Use existing query/export commands, the HTTP client and the shared TUI for new record kinds. JSON/NDJSON retain all decoded fields; TXT/HTML include structured details for metadata-only records.
-- Report unsupported local data, expired or inaccessible history, filtered results and unfinished collectors in coverage. Uploaded contacts require takeout mode.
+- Recover `AUTH_KEY_UNREGISTERED` for downloads from other Telegram datacenters by exporting/importing authorization, then retrying the original request. Preserve takeout wrapping and bound recovery attempts.
+- Exclude all stickers and custom emoji from transcoding. Admit only explicitly supported image, audio and video formats using file signatures and probe results; skip documents, archives, animated images, unknown codecs and odd-sized video. Preserve originals.
+- Carry FFmpeg/ffprobe stderr, exit status and processing context through the worker socket into logs and work errors. Drain diagnostics continuously with bounded memory.
+- Add `retry-failed --target all|work|attachments`, with a read-only preview by default and atomic changes with `--apply`. Retry only failed records, preserving successful results, partial downloads and deduplication. Both bulk retry and `work --resume` reset the attempt budget.
+- Automatically resume compatible unfinished sync jobs. Report progress through all Telegram sync phases.
+- Add offline social graph export with date filtering.
 
-Collectors run automatically during sync; continuous mode refreshes completed snapshots. Existing archives remain readable without migration. Completeness describes data available through the API at collection time, not all historical account activity. Device-local settings, cache, unsynchronized drafts and mini-app local storage are outside API coverage.
+Existing archives remain compatible; no new archive schema migration is required. Failed work is not reset automatically. See [the recovery runbook](https://github.com/cofob/tg_backup/blob/v2.3.0/docs/retry-failed.md) for the coordinated shutdown, SQLite backup, preview/apply and restart procedure. New filtering also applies when retrying old tasks. Historical abbreviated errors cannot be reconstructed.
 
-Validation: 70 workspace tests passed, including 14 new collector tests; formatting and Clippy passed. Live account validation remains opt-in and was not run for this change.
+Local validation: 95 workspace tests passed; formatting and Clippy passed. Three opt-in tests were skipped locally (live Telegram, real FFmpeg, synthetic storage workload). Release CI additionally runs the real-codec and synthetic-storage checks on Linux, builds static Linux clients for x86_64/aarch64, and smoke-tests core/FFmpeg container images before publication.
 
-Release assets contain static Linux clients for x86_64 and aarch64 with SHA-256 checksums. Container images are published to `ghcr.io/cofob/tg-backup` in core and FFmpeg variants.
+Release assets contain static Linux clients with SHA-256 checksums. Images are published to `ghcr.io/cofob/tg-backup` in core and FFmpeg variants. This release does not automatically deploy to existing installations.

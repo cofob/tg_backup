@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tg_backup::{
@@ -50,6 +50,13 @@ enum Command {
         resume: Option<i64>,
         #[arg(long,value_parser=["verify","reindex","seal","repack","consolidate"])]
         enqueue: Option<String>,
+    },
+    /// Requeue failed work/downloads. Stop the coordinator before --apply.
+    RetryFailed {
+        #[arg(long, value_enum, default_value_t = tg_backup::retry::Target::All)]
+        target: tg_backup::retry::Target,
+        #[arg(long)]
+        apply: bool,
     },
     Transcode {
         #[arg(long)]
@@ -146,13 +153,25 @@ async fn main() -> Result<()> {
         }
         Command::Setup(options) => tg_backup::setup::run(&cli.dataset, options).await?,
         Command::WorkerService { socket } => tg_backup::work::service(cli.dataset, socket).await?,
-        Command::WorkerTask => tg_backup::transcode::worker(&cli.dataset)?,
+        Command::WorkerTask => {
+            if let Err(error) = tg_backup::transcode::worker(&cli.dataset) {
+                // Display the chain without Debug's per-line indentation, which can
+                // multiply a bounded stderr tail and obscure the processing stage.
+                eprintln!("{error:#}");
+                std::process::exit(1);
+            }
+        }
         Command::Worker { once } => {
             tg_backup::work::run(
                 std::sync::Arc::new(std::sync::Mutex::new(Archive::open(&cli.dataset, true)?)),
                 once,
             )
             .await?
+        }
+        Command::RetryFailed { target, apply } => {
+            let mut a = Archive::open(&cli.dataset, apply).with_context(||
+                if apply { "opening archive for retry; stop the coordinator and other writers before --apply" } else { "opening archive for retry preview" })?;
+            print(&a.retry_failed(target, apply)?)?;
         }
         Command::Transcode {
             apply,

@@ -121,7 +121,8 @@ pub fn enqueue(a: &Archive, p: &Policy, apply: bool, automatic: bool) -> Result<
         }
         for hash in hashes {
             last = hash.clone();
-            if references_allow(a, &hash, p)? {
+            if references_allow(a, &hash, p)? && crate::media_format::exclusion(a, &hash)?.is_none()
+            {
                 eligible += 1;
                 if apply {
                     a.enqueue_work(
@@ -143,20 +144,33 @@ pub fn enqueue(a: &Archive, p: &Policy, apply: bool, automatic: bool) -> Result<
     Ok(json!({"eligible":eligible,"apply":apply,"automatic":automatic,"recipe":recipe}))
 }
 fn probe(path: &Path) -> Result<Value> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_format",
-            "-show_streams",
-            "-of",
-            "json",
-        ])
-        .arg(path)
-        .output()
-        .context("install FFmpeg and ffprobe or use the ffmpeg image")?;
-    ensure!(output.status.success(), "ffprobe failed");
-    Ok(serde_json::from_slice(&output.stdout)?)
+    let output = crate::diagnostics::output(
+        Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_format",
+                "-show_streams",
+                "-of",
+                "json",
+            ])
+            .arg(path),
+    )
+    .with_context(|| {
+        format!(
+            "starting ffprobe for {}; install FFmpeg and ffprobe or use the ffmpeg image",
+            path.display()
+        )
+    })?;
+    ensure!(
+        output.status.success(),
+        "ffprobe failed for {} ({}); stderr: {}",
+        path.display(),
+        output.status,
+        crate::diagnostics::text(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("invalid ffprobe JSON for {}", path.display()))
 }
 fn number(v: &Value) -> Option<f64> {
     v.as_f64().or_else(|| v.as_str()?.parse().ok())
@@ -165,13 +179,20 @@ fn skipped(reason: &str) -> Value {
     json!({"state":"skipped","reason":reason})
 }
 fn run_ffmpeg(args: &[String]) -> Result<()> {
-    let status = Command::new("ffmpeg")
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    ensure!(status.success(), "FFmpeg failed; original retained");
+    let output = crate::diagnostics::output(
+        Command::new("ffmpeg")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    )
+    .context("starting FFmpeg; install FFmpeg or use the ffmpeg image")?;
+    ensure!(
+        output.status.success(),
+        "FFmpeg failed ({}); original retained; stderr: {}",
+        output.status,
+        crate::diagnostics::text(&output.stderr)
+    );
     Ok(())
 }
 pub fn execute(root: &Path, task: &Task, r: &Resources) -> Result<Value> {
@@ -196,8 +217,16 @@ pub fn execute(root: &Path, task: &Task, r: &Resources) -> Result<Value> {
     let input = crate::media::attachment_path(root, hash)?;
     let p: Policy = serde_json::from_value(task.config["policy"].clone())?;
     p.validate()?;
+    let archive = Archive::open(root, false)?;
+    if let Some(reason) = crate::media_format::exclusion(&archive, hash)? {
+        return Ok(skipped(reason));
+    }
+    drop(archive);
     let bytes = std::fs::metadata(&input)?.len();
-    let data = probe(&input)?;
+    let data = probe(&input).context("probing original media")?;
+    if !crate::media_format::container_supported(&data) {
+        return Ok(skipped("unsupported container"));
+    }
     let streams = data["streams"].as_array().context("missing streams")?;
     if streams
         .iter()
@@ -232,6 +261,20 @@ pub fn execute(root: &Path, task: &Task, r: &Resources) -> Result<Value> {
             ]
             .contains(&f)
         });
+    if streams
+        .iter()
+        .any(|s| !crate::media_format::codec_supported(s, still))
+    {
+        return Ok(skipped("unsupported codec"));
+    }
+    if !still
+        && videos.iter().any(|v| {
+            v["width"].as_u64().is_none_or(|n| n % 2 != 0)
+                || v["height"].as_u64().is_none_or(|n| n % 2 != 0)
+        })
+    {
+        return Ok(skipped("video dimensions are not even"));
+    }
     let kind = if still {
         "photo"
     } else if !videos.is_empty() {
@@ -366,8 +409,9 @@ pub fn execute(root: &Path, task: &Task, r: &Resources) -> Result<Value> {
         "2".into(),
     ]);
     args.push(staging.to_string_lossy().into());
-    run_ffmpeg(&args)?;
-    let output = probe(&staging)?;
+    run_ffmpeg(&args)
+        .with_context(|| format!("encoding {} to {}", input.display(), staging.display()))?;
+    let output = probe(&staging).context("probing encoded media")?;
     let outstreams = output["streams"]
         .as_array()
         .context("missing output streams")?;
@@ -407,7 +451,8 @@ pub fn execute(root: &Path, task: &Task, r: &Resources) -> Result<Value> {
         "-f".into(),
         "null".into(),
         "-".into(),
-    ])?;
+    ])
+    .with_context(|| format!("validating encoded media by decoding {}", staging.display()))?;
     let output_bytes = std::fs::metadata(&staging)?.len();
     if output_bytes >= bytes {
         std::fs::remove_file(staging)?;
@@ -513,7 +558,14 @@ pub fn worker(root: &Path) -> Result<()> {
             tracing::warn!("address-space limit unavailable");
         }
     }
-    let report = execute(root, &request.task, &request.resources)?;
+    let report = execute(root, &request.task, &request.resources).with_context(|| {
+        format!(
+            "worker task {} failed (kind={}, original={})",
+            request.task.sequence,
+            request.task.kind,
+            request.task.config["original"].as_str().unwrap_or("n/a")
+        )
+    })?;
     serde_json::to_writer(std::io::stdout().lock(), &report)?;
     Ok(())
 }

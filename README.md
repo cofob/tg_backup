@@ -529,3 +529,6 @@ Graph exports contain names, exact namespaced IDs and daily relationship counts,
 but no message bodies, phone numbers, attachments or credentials. Existing output
 requires `--overwrite`; completed output is published atomically. Generation is
 local and read-only and does not contact Telegram or change the dataset.
+
+For atomic bulk retry of failed downloads and work, including the Docker recovery
+procedure and supported conversion formats, see [Recover failed downloads and work](docs/retry-failed.md).

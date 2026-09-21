@@ -77,6 +77,7 @@ struct MockReply {
     result: std::result::Result<Value, String>,
 }
 struct Engine {
+    dc_auth_lock: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     mock_rpc: Option<Mutex<std::collections::VecDeque<MockReply>>>,
     client: Client,
@@ -343,6 +344,7 @@ pub async fn sync(root: &Path, mut options: SyncOptions) -> Result<()> {
     let work_task = tokio::spawn(crate::work::run(archive.clone(), false));
     let stop = tokio_util::sync::CancellationToken::new();
     let mut engine = Engine {
+        dc_auth_lock: Arc::new(tokio::sync::Mutex::new(())),
         #[cfg(test)]
         mock_rpc: None,
         client: client.clone(),
@@ -384,6 +386,7 @@ pub async fn sync(root: &Path, mut options: SyncOptions) -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let update_engine = Engine {
+        dc_auth_lock: engine.dc_auth_lock.clone(),
         #[cfg(test)]
         mock_rpc: None,
         client: client.clone(),
@@ -672,17 +675,21 @@ impl Engine {
             .to_bytes();
         }
         let request = RawRequest(bytes);
+        let mut auth_attempted = HashSet::new();
         for attempt in 0..8 {
             self.check_stop()?;
-            let call = async {
-                if let Some(dc) = dc {
-                    self.client.invoke_in_dc(dc, &request).await
-                } else {
-                    self.client.invoke(&request).await
-                }
+            let call = crate::dc_auth::invoke(
+                &self.client,
+                &request,
+                dc,
+                self.session.home_dc_id()?,
+                &mut auth_attempted,
+                &self.dc_auth_lock,
+            );
+            let result = tokio::select! {
+                _ = self.stop.cancelled() => bail!("sync interrupted"),
+                result = call => result.with_context(|| format!("authorizing DC {dc:?} for {name}"))?,
             };
-            let result =
-                tokio::select! {_=self.stop.cancelled()=>bail!("sync interrupted"),r=call=>r};
             match result {
                 Ok(response) => {
                     let (value, slices) = self.schema.decode_slices(&root, &response.0)?;
@@ -2976,6 +2983,7 @@ mod tests {
         );
         let SenderPool { handle, .. } = SenderPool::new(session.clone(), 1);
         Engine {
+            dc_auth_lock: Arc::new(tokio::sync::Mutex::new(())),
             mock_rpc: None,
             client: Client::new(handle),
             session,

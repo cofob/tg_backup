@@ -232,7 +232,7 @@ impl Archive {
     }
     pub fn resume_work(&self, id: i64) -> Result<()> {
         ensure!(self.writable, "read-only archive");
-        ensure!(self.db.execute("UPDATE work SET state='queued',retry_at=0,error=NULL WHERE sequence=?1 AND state IN ('failed','skipped','paused')",[id])?==1,"work is unknown or not resumable");
+        ensure!(self.db.execute("UPDATE work SET state='queued',retry_at=0,attempts=0,error=NULL,progress='{}',updated=?2 WHERE sequence=?1 AND state IN ('failed','skipped','paused')",params![id,Utc::now().timestamp_micros()])?==1,"work is unknown or not resumable");
         Ok(())
     }
     fn claim_work(&self) -> Result<Option<Task>> {
@@ -344,7 +344,11 @@ pub async fn execute(root: &Path, task: &Task, resources: &Resources) -> Result<
         let mut bytes = Vec::new();
         stream.take(4 * 1024 * 1024).read_to_end(&mut bytes).await?;
         let result: Value = serde_json::from_slice(&bytes)?;
-        ensure!(result["error"].is_null(), "worker: {}", result["error"]);
+        ensure!(
+            result["error"].is_null(),
+            "worker: {}",
+            result["error"].as_str().unwrap_or("invalid worker error")
+        );
         return Ok((
             result["report"].clone(),
             result["enforcement"]
@@ -369,7 +373,7 @@ pub(crate) async fn execute_local(
         .arg("worker-task")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     #[cfg(unix)]
     {
@@ -406,8 +410,48 @@ pub(crate) async fn execute_local(
             &json!({"task":task,"resources":resources}),
         )?)
         .await?;
+    let stderr = child.stderr.take().context("worker stderr")?;
+    let drain = tokio::spawn(async move {
+        let mut stderr = stderr;
+        let mut tail = Vec::new();
+        let mut buf = [0u8; 4096];
+        let mut truncated = false;
+        loop {
+            let n = stderr.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            tail.extend_from_slice(&buf[..n]);
+            // The worker adds an anyhow context chain around the tool's 8 KiB tail.
+            // Reserve bounded room for that chain so a second truncation cannot erase it.
+            const WORKER_DIAGNOSTIC_LIMIT: usize = 16 * 1024;
+            if tail.len() > WORKER_DIAGNOSTIC_LIMIT {
+                tail.drain(..tail.len() - WORKER_DIAGNOSTIC_LIMIT);
+                truncated = true;
+            }
+        }
+        if truncated {
+            tail.splice(
+                ..0,
+                b"[truncated; last 16384 worker bytes] ".iter().copied(),
+            );
+        }
+        Ok::<_, std::io::Error>(tail)
+    });
     let output = child.wait_with_output().await?;
-    ensure!(output.status.success(), "worker failed: {}", output.status);
+    let stderr = drain.await??;
+    if !output.status.success() {
+        let error = format!(
+            "worker task {} failed (kind={}, original={}): {}; stderr: {}",
+            task.sequence,
+            task.kind,
+            task.config["original"].as_str().unwrap_or("n/a"),
+            output.status,
+            crate::diagnostics::text(&stderr)
+        );
+        tracing::error!("{error}");
+        anyhow::bail!(error);
+    }
     Ok((
         serde_json::from_slice(&output.stdout).context("invalid worker report")?,
         enforcement,
@@ -466,14 +510,14 @@ pub async fn run(archive: Arc<Mutex<Archive>>, once: bool) -> Result<()> {
                             )?;
                         }
                         Err(e) => {
-                            a.db.execute("UPDATE work SET state='failed',error=?2,updated=?3 WHERE sequence=?1",params![task.sequence,e.to_string(),Utc::now().timestamp_micros()])?;
+                            a.db.execute("UPDATE work SET state='failed',error=?2,updated=?3 WHERE sequence=?1",params![task.sequence,format!("{e:#}"),Utc::now().timestamp_micros()])?;
                         }
                     }
                     heartbeat(&a, "idle", &mode)?;
                 }
                 Err(e) => {
                     let now = Utc::now().timestamp_micros();
-                    a.db.execute("UPDATE work SET state=CASE WHEN attempts<3 THEN 'queued' ELSE 'failed' END,error=?2,updated=?3,retry_at=?3+60000000*attempts WHERE sequence=?1",params![task.sequence,e.to_string(),now])?;
+                    a.db.execute("UPDATE work SET state=CASE WHEN attempts<3 THEN 'queued' ELSE 'failed' END,error=?2,updated=?3,retry_at=?3+60000000*attempts WHERE sequence=?1",params![task.sequence,format!("{e:#}"),now])?;
                 }
             }
         } else if once {
@@ -541,7 +585,7 @@ pub async fn service(root: std::path::PathBuf, socket: std::path::PathBuf) -> Re
                 }
                 json!({"report":report,"enforcement":enforcement})
             }
-            Err(e) => json!({"error":e.to_string()}),
+            Err(e) => json!({"error":format!("{e:#}")}),
         };
         let _ = stream.write_all(&serde_json::to_vec(&result)?).await;
     }
@@ -567,7 +611,7 @@ pub async fn manual(a: &mut Archive, kind: &str) -> Result<Value> {
             if let Err(e) = crate::transcode::publish(a, &task, &report) {
                 a.db.execute(
                     "UPDATE work SET state='failed',error=?2 WHERE sequence=?1",
-                    params![id, e.to_string()],
+                    params![id, format!("{e:#}")],
                 )?;
                 return Err(e);
             }
@@ -581,7 +625,7 @@ pub async fn manual(a: &mut Archive, kind: &str) -> Result<Value> {
         Err(e) => {
             a.db.execute(
                 "UPDATE work SET state='failed',error=?2 WHERE sequence=?1",
-                params![id, e.to_string()],
+                params![id, format!("{e:#}")],
             )?;
             Err(e)
         }
