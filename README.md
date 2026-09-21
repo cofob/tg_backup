@@ -44,12 +44,15 @@ tg-backup sync --max-messages 10000 --max-seconds 3600
 tg-backup sync --max-media-bytes 1073741824
 tg-backup jobs
 tg-backup sync --resume JOB_ID
+tg-backup sync --new-job
 tg-backup abort-takeout JOB_ID
 ```
 
-Limits apply per invocation, including when resuming a job. Saved selectors, history cursors, media offsets, retry deadlines, and Telegram update checkpoints survive restarts. Completed backfills are reused by new jobs with the same date/ID boundaries. One-off runs stop; continuous runs receive live updates and periodically audit existing data.
+By default, `sync` (and continuous capture via `run`) resumes the most recently updated compatible unfinished job (`running`, `paused`, or `failed`). Compatibility requires matching continuous/takeout modes, date/ID boundaries, and effective history/attachment selectors, including defaults from the current configuration. If none matches, a new job is created; completed jobs are not automatically resumed. Use `--new-job` to force a new job, or `--resume JOB_ID` to select a specific job with its saved scope and mode. These two flags cannot be combined. Startup logs identify the job and whether it was resumed or created.
 
-`--since` and `--until` are Unix seconds; `--until` is exclusive. `--min-id` and `--max-id` are Telegram history RPC bounds. Job status distinguishes completion, completion with gaps, pausing, and failure. Details include the stop reason and resume command. A takeout initialization delay is recorded with its retry time; expired takeouts are replaced on explicit resume. Limited/interrupted takeouts remain resumable; `abort-takeout` explicitly closes one.
+Limits apply per invocation, including when resuming a job: `--max-messages`, `--max-media-bytes`, and `--max-seconds` always come from the current command; omitted limits are unlimited. Saved selectors, history cursors, media offsets, retry deadlines, and Telegram update checkpoints survive restarts. Completed backfills are reused by new jobs with the same date/ID boundaries. One-off runs stop; continuous runs receive live updates and periodically audit existing data.
+
+`--since` and `--until` are Unix seconds; `--until` is exclusive. `--min-id` and `--max-id` are Telegram history RPC bounds. Job status distinguishes completion, completion with gaps, pausing, and failure. Details include the stop reason and resume command. A takeout initialization delay is recorded with its retry time; expired takeouts are replaced on resume. Limited/interrupted takeouts remain resumable; `abort-takeout` explicitly closes one.
 
 ## Dataset
 

@@ -41,8 +41,13 @@ pub struct SyncOptions {
     pub continuous: bool,
     #[arg(long)]
     pub takeout: bool,
-    #[arg(long)]
+    /// Resume a specific job using its saved scope and mode.
+    #[arg(long, conflicts_with = "new_job")]
     pub resume: Option<String>,
+    /// Create a new job instead of resuming a compatible unfinished job.
+    #[arg(long)]
+    #[serde(default)]
+    pub new_job: bool,
     #[arg(long)]
     pub max_messages: Option<u64>,
     #[arg(long)]
@@ -154,21 +159,74 @@ pub async fn authenticate(root: &Path) -> Result<()> {
     let _ = task.await;
     result
 }
-pub async fn sync(root: &Path, mut options: SyncOptions) -> Result<()> {
-    let mut archive = Archive::open(root, true)?;
-    archive.db.execute_batch("CREATE TABLE IF NOT EXISTS peers(key TEXT PRIMARY KEY,input TEXT NOT NULL,metadata TEXT NOT NULL,raw TEXT NOT NULL); CREATE TABLE IF NOT EXISTS folders(id TEXT PRIMARY KEY,data TEXT NOT NULL);")?;
+fn prepare_sync_job(archive: &mut Archive, options: &mut SyncOptions) -> Result<String> {
+    ensure!(
+        !(options.new_job && options.resume.is_some()),
+        "--new-job cannot be combined with --resume"
+    );
+    let limits = (
+        options.max_messages,
+        options.max_media_bytes,
+        options.max_seconds,
+    );
+    if options.resume.is_none() && !options.new_job {
+        let mut statement = archive.db.prepare(
+            "SELECT id,config FROM jobs WHERE status IN ('running','paused','failed') ORDER BY updated DESC,created DESC,rowid DESC",
+        )?;
+        let jobs = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for job in jobs {
+            let (id, config) = job?;
+            let stored: SyncOptions = serde_json::from_str(&config)
+                .with_context(|| format!("invalid config for sync job {id}"))?;
+            if options.continuous == stored.continuous
+                && options.takeout == stored.takeout
+                && options.min_id == stored.min_id
+                && options.max_id == stored.max_id
+                && options.since == stored.since
+                && options.until == stored.until
+                && options
+                    .history_selector
+                    .as_ref()
+                    .unwrap_or(&archive.config.history_selector)
+                    == stored
+                        .history_selector
+                        .as_ref()
+                        .unwrap_or(&archive.config.history_selector)
+                && options
+                    .attachment_selector
+                    .as_ref()
+                    .unwrap_or(&archive.config.attachment_selector)
+                    == stored
+                        .attachment_selector
+                        .as_ref()
+                        .unwrap_or(&archive.config.attachment_selector)
+            {
+                options.resume = Some(id);
+                break;
+            }
+        }
+    }
     let job = if let Some(job) = &options.resume {
         let stored: String = archive
             .db
             .query_row("SELECT config FROM jobs WHERE id=?1", [job], |r| r.get(0))
             .context("unknown job")?;
         let job = job.clone();
-        options = serde_json::from_str(&stored)?;
+        *options = serde_json::from_str(&stored)?;
         options.resume = Some(job.clone());
         job
     } else {
         uuid::Uuid::new_v4().to_string()
     };
+    // Limits belong to this invocation, including an explicit resume.
+    (
+        options.max_messages,
+        options.max_media_bytes,
+        options.max_seconds,
+    ) = limits;
+    options.new_job = false;
     if let Some(selector) = &options.history_selector {
         archive.config.history_selector = selector.clone();
     }
@@ -180,9 +238,20 @@ pub async fn sync(root: &Path, mut options: SyncOptions) -> Result<()> {
     // Persist resolved selectors so a resume is independent of subsequent config edits.
     options.history_selector = Some(archive.config.history_selector.clone());
     options.attachment_selector = Some(archive.config.attachment_selector.clone());
-    archive.db.execute("INSERT INTO jobs VALUES(?1,?2,'running',?3,?3,'{}') ON CONFLICT(id) DO UPDATE SET status='running',updated=excluded.updated",params![job,serde_json::to_string(&options)?,now()])?;
+    archive.db.execute("INSERT INTO jobs VALUES(?1,?2,'running',?3,?3,'{}') ON CONFLICT(id) DO UPDATE SET status='running',config=excluded.config,updated=excluded.updated",params![job,serde_json::to_string(&options)?,now()])?;
     archive.set_checkpoint(&format!("pause_reason:{job}"), &Value::Null)?;
-    tracing::info!(%job,"sync job started");
+    if options.resume.is_some() {
+        tracing::info!(%job, "sync job resumed");
+    } else {
+        tracing::info!(%job, "new sync job started");
+    }
+    Ok(job)
+}
+
+pub async fn sync(root: &Path, mut options: SyncOptions) -> Result<()> {
+    let mut archive = Archive::open(root, true)?;
+    archive.db.execute_batch("CREATE TABLE IF NOT EXISTS peers(key TEXT PRIMARY KEY,input TEXT NOT NULL,metadata TEXT NOT NULL,raw TEXT NOT NULL); CREATE TABLE IF NOT EXISTS folders(id TEXT PRIMARY KEY,data TEXT NOT NULL);")?;
+    let job = prepare_sync_job(&mut archive, &mut options)?;
     let (id, _) = credentials(root).await?;
     let session = Arc::new(SqliteSession::open(root.join("session.sqlite3")).await?);
     let SenderPool {
@@ -2690,6 +2759,204 @@ fn takeout_method(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::{config::Config, query::Query};
+
+    #[test]
+    fn sync_job_selection_resumes_only_unfinished_jobs_and_honors_new_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut archive = Archive::init(dir.path(), &Config::default()).unwrap();
+        let first = prepare_sync_job(&mut archive, &mut SyncOptions::default()).unwrap();
+        for status in ["running", "paused", "failed"] {
+            archive
+                .db
+                .execute("UPDATE jobs SET status=?1", [status])
+                .unwrap();
+            let mut options = SyncOptions::default();
+            assert_eq!(prepare_sync_job(&mut archive, &mut options).unwrap(), first);
+            assert_eq!(options.resume.as_deref(), Some(first.as_str()));
+        }
+        let second = prepare_sync_job(
+            &mut archive,
+            &mut SyncOptions {
+                new_job: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_ne!(first, second);
+        // Force a tie in timestamps: the most recently inserted job wins.
+        archive
+            .db
+            .execute("UPDATE jobs SET updated=1,created=1", [])
+            .unwrap();
+        assert_eq!(
+            prepare_sync_job(&mut archive, &mut SyncOptions::default()).unwrap(),
+            second
+        );
+        for status in ["complete", "complete_with_gaps", "aborted"] {
+            archive
+                .db
+                .execute("UPDATE jobs SET status=?1", [status])
+                .unwrap();
+            let mut options = SyncOptions::default();
+            let fresh = prepare_sync_job(&mut archive, &mut options).unwrap();
+            assert_ne!(fresh, first);
+            assert_ne!(fresh, second);
+            assert!(options.resume.is_none());
+        }
+    }
+
+    #[test]
+    fn sync_job_selection_checks_scope_mode_and_config_selectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut archive = Archive::init(dir.path(), &Config::default()).unwrap();
+        let first = prepare_sync_job(&mut archive, &mut SyncOptions::default()).unwrap();
+        for mut options in [
+            SyncOptions {
+                continuous: true,
+                ..Default::default()
+            },
+            SyncOptions {
+                takeout: true,
+                ..Default::default()
+            },
+            SyncOptions {
+                min_id: Some(1),
+                ..Default::default()
+            },
+            SyncOptions {
+                max_id: Some(100),
+                ..Default::default()
+            },
+            SyncOptions {
+                since: Some(1),
+                ..Default::default()
+            },
+            SyncOptions {
+                until: Some(100),
+                ..Default::default()
+            },
+            SyncOptions {
+                history_selector: Some("false".into()),
+                ..Default::default()
+            },
+            SyncOptions {
+                attachment_selector: Some("false".into()),
+                ..Default::default()
+            },
+        ] {
+            archive.config = Config::default();
+            let fresh = prepare_sync_job(&mut archive, &mut options).unwrap();
+            assert_ne!(fresh, first);
+            assert!(options.resume.is_none());
+            assert_eq!(prepare_sync_job(&mut archive, &mut options).unwrap(), fresh);
+        }
+        archive.config = Config::default();
+        // More recent incompatible jobs must not hide an older matching job.
+        assert_eq!(
+            prepare_sync_job(&mut archive, &mut SyncOptions::default()).unwrap(),
+            first
+        );
+        archive.config.history_selector = "false".into();
+        let mut options = SyncOptions::default();
+        assert_ne!(prepare_sync_job(&mut archive, &mut options).unwrap(), first);
+    }
+
+    #[test]
+    fn sync_job_resume_uses_current_limits_and_preserves_saved_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut archive = Archive::init(dir.path(), &Config::default()).unwrap();
+        let first = prepare_sync_job(
+            &mut archive,
+            &mut SyncOptions {
+                max_messages: Some(1),
+                max_media_bytes: Some(2),
+                max_seconds: Some(3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        archive
+            .set_checkpoint(&format!("messages:{first}"), &json!(123))
+            .unwrap();
+        let mut options = SyncOptions {
+            max_messages: Some(4),
+            max_seconds: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(prepare_sync_job(&mut archive, &mut options).unwrap(), first);
+        assert_eq!(
+            (
+                options.max_messages,
+                options.max_media_bytes,
+                options.max_seconds
+            ),
+            (Some(4), None, Some(5))
+        );
+        let saved: String = archive
+            .db
+            .query_row("SELECT config FROM jobs WHERE id=?1", [&first], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let saved: SyncOptions = serde_json::from_str(&saved).unwrap();
+        assert_eq!(saved.max_messages, Some(4));
+        archive.config.history_selector = "false".into();
+        let mut explicit = SyncOptions {
+            resume: Some(first.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            prepare_sync_job(&mut archive, &mut explicit).unwrap(),
+            first
+        );
+        assert_eq!(explicit.history_selector, saved.history_selector);
+        assert_eq!(
+            (
+                explicit.max_messages,
+                explicit.max_media_bytes,
+                explicit.max_seconds
+            ),
+            (None, None, None)
+        );
+        assert_eq!(
+            archive.checkpoint(&format!("messages:{first}")).unwrap(),
+            Some(json!(123))
+        );
+        let mut legacy = serde_json::to_value(saved).unwrap();
+        legacy.as_object_mut().unwrap().remove("new_job");
+        assert!(
+            !serde_json::from_value::<SyncOptions>(legacy)
+                .unwrap()
+                .new_job
+        );
+        assert!(
+            prepare_sync_job(
+                &mut archive,
+                &mut SyncOptions {
+                    resume: Some("missing".into()),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sync_job_cli_rejects_new_job_with_explicit_resume() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Args {
+            #[command(flatten)]
+            options: SyncOptions,
+        }
+        assert!(
+            Args::try_parse_from(["sync", "--new-job"])
+                .unwrap()
+                .options
+                .new_job
+        );
+        assert!(Args::try_parse_from(["sync", "--new-job", "--resume", "id"]).is_err());
+    }
 
     pub(super) async fn fixture(root: &Path, config: Config) -> Engine {
         let a = Archive::init(root, &config).unwrap();
