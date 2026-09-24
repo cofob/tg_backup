@@ -2243,7 +2243,16 @@ impl Engine {
         }
         Ok(())
     }
+    /// Keep eligibility fixed for one pass so failed media cannot starve peer traversal.
+    fn next_pending_media(
+        &self,
+        eligible_before: i64,
+    ) -> Result<Option<(String, String, i32, Option<u64>, u64)>> {
+        let a = self.archive.lock().unwrap();
+        Ok(a.db.query_row("SELECT id,location,dc,size,offset FROM media WHERE status!='complete' AND status!='unavailable' AND retry_at<=?1 ORDER BY attempts,id LIMIT 1",[eligible_before],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i32>(2)?,r.get::<_,Option<u64>>(3)?,r.get::<_,u64>(4)?))).optional()?)
+    }
     async fn download_pending(&self) -> Result<()> {
+        let eligible_before = Utc::now().timestamp();
         loop {
             self.check_stop()?;
             let used = self
@@ -2264,10 +2273,7 @@ impl Engine {
                     .set_checkpoint(&format!("pause_reason:{}", self.job), &json!("media_limit"))?;
                 break;
             }
-            let row = {
-                let a = self.archive.lock().unwrap();
-                a.db.query_row("SELECT id,location,dc,size,offset FROM media WHERE status!='complete' AND status!='unavailable' AND retry_at<=?1 ORDER BY attempts,id LIMIT 1",[Utc::now().timestamp()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i32>(2)?,r.get::<_,Option<u64>>(3)?,r.get::<_,u64>(4)?))).optional()?
-            };
+            let row = self.next_pending_media(eligible_before)?;
             let Some((id, location, dc, size, offset)) = row else {
                 break;
             };
@@ -2392,17 +2398,18 @@ impl Engine {
         Ok(())
     }
     async fn refresh_media_reference(&self, id: &str) -> Result<()> {
-        let contexts = {
+        let (original_location, contexts) = {
             let a = self.archive.lock().unwrap();
-            a.db.prepare("SELECT DISTINCT o.metadata FROM observations o JOIN media_refs r ON r.observation=o.id WHERE r.media=?1")?.query_map([id],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+            let original_location: String =
+                a.db.query_row("SELECT location FROM media WHERE id=?1", [id], |r| r.get(0))?;
+            let contexts = a.db.prepare("SELECT DISTINCT o.metadata FROM observations o JOIN media_refs r ON r.observation=o.id WHERE r.media=?1")?.query_map([id],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            (original_location, contexts)
         };
         for ctx in contexts {
             let ctx: Value = serde_json::from_str(&ctx)?;
-            if self.refresh_extra_media(&ctx).await? {
-                self.archive.lock().unwrap().db.execute(
-                    "UPDATE media SET retry_at=strftime('%s','now')+5 WHERE id=?1",
-                    [id],
-                )?;
+            if self.refresh_extra_media(&ctx).await?
+                && self.schedule_refreshed_media(id, &original_location)?
+            {
                 return Ok(());
             }
             let Some(peer) = ctx["peer"].as_str() else {
@@ -2442,15 +2449,27 @@ impl Engine {
             } else {
                 peer.to_string()
             };
-            if self.collect(method, args, &scope).await?.is_some() {
-                self.archive.lock().unwrap().db.execute(
-                    "UPDATE media SET retry_at=strftime('%s','now')+5 WHERE id=?1",
-                    [id],
-                )?;
+            if self.collect(method, args, &scope).await?.is_some()
+                && self.schedule_refreshed_media(id, &original_location)?
+            {
                 return Ok(());
             }
         }
         Ok(())
+    }
+    /// A successful collector response is not proof that the expired file reference changed.
+    fn schedule_refreshed_media(&self, id: &str, original_location: &str) -> Result<bool> {
+        let a = self.archive.lock().unwrap();
+        let current_location: String =
+            a.db.query_row("SELECT location FROM media WHERE id=?1", [id], |r| r.get(0))?;
+        if current_location == original_location {
+            return Ok(false);
+        }
+        a.db.execute(
+            "UPDATE media SET retry_at=strftime('%s','now')+5 WHERE id=?1",
+            [id],
+        )?;
+        Ok(true)
     }
 }
 fn peer_selected(config: &crate::config::Config, metadata: &Value) -> Result<bool> {
@@ -3306,6 +3325,130 @@ mod tests {
         );
         a.verify().unwrap();
     }
+    #[tokio::test]
+    async fn unchanged_media_reference_keeps_failure_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fixture(dir.path(), Config::default()).await;
+        e.archive
+            .lock()
+            .unwrap()
+            .db
+            .execute(
+                "INSERT INTO jobs VALUES('fixture','{}','running',0,0,'{}')",
+                [],
+            )
+            .unwrap();
+        e.capture(
+            "Message",
+            &e.schema.encode("Message", &message()).unwrap(),
+            "history",
+            Some("user:42"),
+            None,
+            None,
+        )
+        .unwrap();
+        let retry_at = Utc::now().timestamp() + 300;
+        let contexts: Vec<String> = e.archive.lock().unwrap().db.prepare(
+            "SELECT o.metadata FROM observations o JOIN media_refs r ON r.observation=o.id WHERE r.media='photo:123:x'"
+        ).unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        assert!(
+            !contexts.is_empty(),
+            "test requires archived media contexts"
+        );
+        assert!(
+            contexts.iter().any(|ctx| {
+                let ctx: Value = serde_json::from_str(ctx).unwrap();
+                ctx["peer"] == "user:42" && integer(&ctx["message_id"]) == Some(17)
+            }),
+            "test requires a refreshable message context: {contexts:?}"
+        );
+        e.archive
+            .lock()
+            .unwrap()
+            .media_error("photo:123:x", "FILE_REFERENCE_EXPIRED", retry_at)
+            .unwrap();
+        e.mock_rpc = Some(Mutex::new(std::iter::repeat_with(|| MockReply {
+            method: "messages.getMessages",
+            args: json!({"id":[{"_":"inputMessageID","id":17}]}),
+            dc: None,
+            result: Ok(json!({"_":"messages.messages","messages":[message()],"chats":[],"users":[],"topics":[]})),
+        }).take(100).collect()));
+        e.refresh_media_reference("photo:123:x").await.unwrap();
+        assert!(
+            e.mock_rpc.as_ref().unwrap().lock().unwrap().len() < 100,
+            "refresh must issue an RPC"
+        );
+        let a = e.archive.lock().unwrap();
+        let coverage: Vec<String> =
+            a.db.prepare("SELECT details FROM coverage")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+        assert!(
+            coverage.iter().all(|c| !c.contains("error")),
+            "refresh failed: {coverage:?}"
+        );
+        let actual: i64 =
+            a.db.query_row(
+                "SELECT retry_at FROM media WHERE id='photo:123:x'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            actual, retry_at,
+            "a stale reference must not be retried in five seconds"
+        );
+        let original_location: String =
+            a.db.query_row(
+                "SELECT location FROM media WHERE id='photo:123:x'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut refreshed: Value = serde_json::from_str(&original_location).unwrap();
+        refreshed["file_reference"] = json!({"$bytes":"ef01"});
+        a.db.execute(
+            "UPDATE media SET location=?1 WHERE id='photo:123:x'",
+            [refreshed.to_string()],
+        )
+        .unwrap();
+        drop(a);
+        assert!(
+            e.schedule_refreshed_media("photo:123:x", &original_location)
+                .unwrap()
+        );
+        let soon: i64 = e
+            .archive
+            .lock()
+            .unwrap()
+            .db
+            .query_row(
+                "SELECT retry_at FROM media WHERE id='photo:123:x'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(soon < retry_at, "a new reference should be retried soon");
+    }
+
+    #[tokio::test]
+    async fn media_download_pass_does_not_reselect_newly_due_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = fixture(dir.path(), Config::default()).await;
+        let a = e.archive.lock().unwrap();
+        a.db.execute(
+            "INSERT INTO media(id,location,dc,retry_at) VALUES('stale','{}',2,100)",
+            [],
+        )
+        .unwrap();
+        drop(a);
+        assert!(e.next_pending_media(99).unwrap().is_none());
+        assert_eq!(e.next_pending_media(100).unwrap().unwrap().0, "stale");
+    }
+
     #[tokio::test]
     async fn invocation_limits_resume_from_saved_totals_and_completed_media_stage() {
         let dir = tempfile::tempdir().unwrap();
