@@ -124,6 +124,8 @@ struct MockReply {
     dc: Option<i32>,
     result: std::result::Result<Value, String>,
 }
+// id, serialized location, datacenter, expected size, downloaded offset.
+type PendingMedia = (String, String, i32, Option<u64>, u64);
 struct Engine {
     dc_auth_lock: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
@@ -2244,10 +2246,7 @@ impl Engine {
         Ok(())
     }
     /// Keep eligibility fixed for one pass so failed media cannot starve peer traversal.
-    fn next_pending_media(
-        &self,
-        eligible_before: i64,
-    ) -> Result<Option<(String, String, i32, Option<u64>, u64)>> {
+    fn next_pending_media(&self, eligible_before: i64) -> Result<Option<PendingMedia>> {
         let a = self.archive.lock().unwrap();
         Ok(a.db.query_row("SELECT id,location,dc,size,offset FROM media WHERE status!='complete' AND status!='unavailable' AND retry_at<=?1 ORDER BY attempts,id LIMIT 1",[eligible_before],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i32>(2)?,r.get::<_,Option<u64>>(3)?,r.get::<_,u64>(4)?))).optional()?)
     }
