@@ -44,6 +44,17 @@ enum Command {
         action: String,
     },
     Coverage,
+    /// Paginated per-dialog history backup status.
+    DialogStatus {
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long = "type")]
+        dialog_type: Option<String>,
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     Jobs,
     Attachments,
     Attachment {
@@ -221,6 +232,25 @@ async fn main() -> Result<()> {
                 .error_for_status()?
                 .json()
                 .await?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+        Command::DialogStatus {
+            status,
+            dialog_type,
+            after,
+            limit,
+        } => {
+            let value: serde_json::Value = auth(
+                client
+                    .get(format!("{url}/v2/dialog-status"))
+                    .query(&[("status", status), ("type", dialog_type), ("after", after)])
+                    .query(&[("limit", limit)]),
+            )
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
         Command::Attachment { hash, output } => {

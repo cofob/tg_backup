@@ -122,6 +122,20 @@ async fn table(
     .map(Json)
     .map_err(error)
 }
+async fn dialog_status(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Query(options): axum::extract::Query<crate::dialog_status::Options>,
+) -> ApiResult {
+    tokio::task::spawn_blocking(move || {
+        let archive = Archive::open(&state.root, false)?;
+        Ok::<_, anyhow::Error>(Json(serde_json::to_value(
+            archive.dialog_status_page(&options)?,
+        )?))
+    })
+    .await
+    .map_err(error)?
+    .map_err(error)
+}
 async fn attachment(
     State(state): State<Arc<ApiState>>,
     Path(hash): Path<String>,
@@ -210,6 +224,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v2/versions", post(versions))
         .route("/v2/events", post(events))
         .route("/v2/attachments/{hash}", get(attachment))
+        .route("/v2/dialog-status", get(dialog_status))
         .route("/v2/{name}", get(table))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), authorize))

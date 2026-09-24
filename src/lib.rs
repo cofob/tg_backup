@@ -1,5 +1,6 @@
 pub mod archive;
 pub mod config;
+pub mod dialog_status;
 pub mod export;
 pub mod http;
 pub mod media;

@@ -69,6 +69,54 @@ pub struct SyncOptions {
     #[arg(long)]
     pub attachment_selector: Option<String>,
 }
+fn full_history_scan(options: &SyncOptions, visited: usize, expected: usize) -> bool {
+    expected > 0
+        && visited == expected
+        && options.min_id.is_none()
+        && options.max_id.is_none()
+        && options.since.is_none()
+        && options.until.is_none()
+        && options.history_selector.as_deref() == Some("true")
+}
+#[cfg(test)]
+mod history_status_tests {
+    use super::*;
+
+    #[test]
+    fn only_full_unfiltered_scans_establish_history_coverage() {
+        let full = SyncOptions {
+            history_selector: Some("true".into()),
+            ..Default::default()
+        };
+        assert!(full_history_scan(&full, 2, 2));
+        assert!(!full_history_scan(&full, 1, 2));
+        assert!(!full_history_scan(&full, 0, 0));
+        assert!(!full_history_scan(
+            &SyncOptions {
+                min_id: Some(1),
+                ..full.clone()
+            },
+            1,
+            1
+        ));
+        assert!(!full_history_scan(
+            &SyncOptions {
+                since: Some(1),
+                ..full.clone()
+            },
+            1,
+            1
+        ));
+        assert!(!full_history_scan(
+            &SyncOptions {
+                history_selector: Some("false".into()),
+                ..full
+            },
+            1,
+            1
+        ));
+    }
+}
 #[cfg(test)]
 struct MockReply {
     method: &'static str,
@@ -1542,7 +1590,15 @@ impl Engine {
         Ok(reached)
     }
     async fn history(&self, key: &str, peer: &Value) -> Result<()> {
-        for (range_index, range) in self.ranges().await?.iter().enumerate() {
+        let ranges = self.ranges().await?;
+        let mut completed_at = None;
+        let mut visited = 0;
+        self.archive.lock().unwrap().coverage(
+            &format!("history:{key}"),
+            "in_progress",
+            &json!({"reason":"history scan in progress"}),
+        )?;
+        for (range_index, range) in ranges.iter().enumerate() {
             if self.takeout.is_some()
                 && self
                     .archive
@@ -1553,6 +1609,7 @@ impl Engine {
             {
                 continue;
             }
+            visited += 1;
             let policy = serde_json::to_vec(
                 &json!({"min_id":self.options.min_id,"max_id":self.options.max_id,"since":self.options.since,"until":self.options.until,"range":range,"history_selector":self.options.history_selector,"attachment_selector":self.options.attachment_selector}),
             )?;
@@ -1566,6 +1623,7 @@ impl Engine {
             let audit_secs = self.archive.lock().unwrap().config.audit_interval_seconds;
             let completed = integer(&saved["completed_at"]);
             if completed.is_some() && !self.options.continuous && saved["job"] == self.job {
+                completed_at = completed_at.max(completed);
                 continue;
             }
             let audit = integer(&saved["audited_at"])
@@ -1704,15 +1762,27 @@ impl Engine {
                 };
                 self.message_enrichment(key, peer, &enriched).await?;
                 if done {
-                    self.archive.lock().unwrap().coverage(
-                        &format!("history:{key}"),
-                        "complete",
-                        &progress,
-                    )?;
+                    completed_at = completed_at.max(integer(&progress["completed_at"]));
                     break;
                 }
                 offset = next;
             }
+        }
+        if let Some(at) = completed_at {
+            let full_history = full_history_scan(&self.options, visited, ranges.len());
+            let archive = self.archive.lock().unwrap();
+            archive.set_checkpoint(&format!("history_success:{key}"), &json!(at))?;
+            archive.coverage(
+                &format!("history:{key}"),
+                if full_history { "complete" } else { "limited" },
+                &json!({"completed_at":at,"full_history":full_history,"reason":if full_history {Value::Null} else {json!("history scan restricted by selectors, bounds, or missing ranges")}}),
+            )?;
+        } else {
+            self.archive.lock().unwrap().coverage(
+                &format!("history:{key}"),
+                "incomplete",
+                &json!({"reason":"No completed getHistory range"}),
+            )?;
         }
         Ok(())
     }

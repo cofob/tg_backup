@@ -247,9 +247,30 @@ Endpoints:
 - `POST /v2/messages`, `/v2/versions`, `/v2/events`: message/history/event views.
 - `GET /v2/history/{key}`: an object's observed history.
 - `GET /v2/status`, `/v2/jobs`, `/v2/coverage`, `/v2/attachments`.
+- `GET /v2/dialog-status`: paginated per-dialog history status.
 - `GET /v2/attachments/{content_hash}`: attachment bytes.
 
 The API opens the archive read-only. It has no Telegram mutation, sync, maintenance, arbitrary SQL, or arbitrary-file endpoints. POST is used only for read-only query bodies.
+
+`GET /v2/dialog-status?status=incomplete&type=group&limit=50` lists peers with an
+archived, observed dialog record (`{peer_id}/dialog`) by `peer_id`; cache-only
+contacts and message senders are excluded, even if their peer metadata exists.
+This works with older archives without a metadata migration. Use `next_cursor`
+as `after` for the next page. Each item has `peer_id`,
+`display_name` (null when unknown), `dialog_type` (`user`, `group`, `channel`),
+`history_backup_status` (`complete`, `limited`, `incomplete`, `not_started`),
+`last_successful_sync_at` (Unix microseconds or null), `errors`, and `coverage_gaps`.
+Filters accept those status/type values; `limit` is 1–200 (default 50). Use
+`tg-backup-client dialog-status --status incomplete --type group` for client access.
+Pages reflect live archive state; peers may change between requests.
+
+`complete` requires explicitly recorded, unbounded, unfiltered `getHistory`
+coverage of all applicable ranges. Legacy completion records without that evidence
+are `incomplete`; bounded or selector-restricted scans are `limited`. A later failure
+retains the last successful scan time. Message-specific `getMessages` lookups,
+including media-reference refreshes, **never** establish complete history coverage.
+Access limitations appear in `coverage_gaps`; completion only describes history
+accessible through Telegram at scan time.
 
 ## Maintenance and retention
 
