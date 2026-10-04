@@ -374,6 +374,17 @@ impl Archive {
     pub fn materialize(&mut self) -> Result<()> {
         self.materialize_with_hook(|_| Ok(()))
     }
+    pub fn materialize_if_ready(&mut self) -> Result<()> {
+        let pending: u64 = self.db.query_row(
+            "SELECT COALESCE(SUM(length(journal)),0) FROM payloads WHERE journal IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        if pending >= self.config.block_bytes as u64 {
+            self.materialize()?;
+        }
+        Ok(())
+    }
     pub fn materialize_with_hook(
         &mut self,
         mut hook: impl FnMut(CommitPoint) -> Result<()>,

@@ -1196,7 +1196,7 @@ impl Engine {
             "UPDATE jobs SET updated=?2 WHERE id=?1",
             params![self.job, now()],
         )?;
-        archive.materialize()?;
+        archive.materialize_if_ready()?;
         Ok(value)
     }
     async fn fetch(&self, name: &str, args: Value, scope: &str) -> Result<Value> {

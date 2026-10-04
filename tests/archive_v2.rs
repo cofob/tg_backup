@@ -76,7 +76,7 @@ fn journal_recovery_occurrences_and_epoch_sealing() {
 fn catalog_indexes_are_migrated() {
     let dir = tempfile::tempdir().unwrap();
     let a = Archive::init(dir.path(), &Config::default()).unwrap();
-    a.db.execute_batch("DROP INDEX observations_epoch_id; DROP INDEX payloads_pending_epoch; DROP INDEX media_pending;")
+    a.db.execute_batch("DROP INDEX observations_epoch_id; DROP INDEX payloads_pending_epoch; DROP INDEX media_pending; DROP INDEX representations_hash;")
         .unwrap();
     drop(a);
     let a = Archive::open(dir.path(), true).unwrap();
@@ -84,6 +84,7 @@ fn catalog_indexes_are_migrated() {
         "observations_epoch_id",
         "payloads_pending_epoch",
         "media_pending",
+        "representations_hash",
     ] {
         assert!(
             a.db.query_row(
@@ -103,6 +104,55 @@ fn catalog_indexes_are_migrated() {
         )
         .unwrap();
     assert!(plan.contains("media_pending"), "unexpected plan: {plan}");
+    let plan: Vec<String> = a
+        .db
+        .prepare("EXPLAIN QUERY PLAN SELECT * FROM representations WHERE original='x' OR hash='x'")
+        .unwrap()
+        .query_map([], |r| r.get(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        plan.iter().any(|row| row.contains("representations_hash")),
+        "unexpected plan: {plan:?}"
+    );
+}
+#[test]
+fn materialization_waits_for_a_full_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = Archive::init(
+        dir.path(),
+        &Config {
+            block_bytes: 4096,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let schema = a.register_schema(1, SCHEMA).unwrap();
+    a.ingest(&schema, &[item("small", 1_800_000_000_000_000)], None)
+        .unwrap();
+    a.materialize_if_ready().unwrap();
+    assert_eq!(
+        a.db.query_row(
+            "SELECT COUNT(*) FROM payloads WHERE journal IS NOT NULL",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    a.ingest(&schema, &[item(&"x".repeat(5000), 1_800_000_000_000_001)], None)
+        .unwrap();
+    a.materialize_if_ready().unwrap();
+    assert_eq!(
+        a.db.query_row(
+            "SELECT COUNT(*) FROM payloads WHERE journal IS NOT NULL",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
 }
 #[test]
 fn layers_and_optional_field_retention() {

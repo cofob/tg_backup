@@ -119,6 +119,7 @@ pub fn migrate(db: &Connection) -> Result<()> {
     CREATE INDEX IF NOT EXISTS payloads_pending_epoch ON payloads(epoch) WHERE journal IS NOT NULL;
     CREATE INDEX IF NOT EXISTS media_pending ON media(attempts,id,retry_at) WHERE status!='complete' AND status!='unavailable';
     CREATE TABLE IF NOT EXISTS representations(original TEXT NOT NULL,hash TEXT NOT NULL,recipe TEXT NOT NULL,bytes INTEGER NOT NULL,created INTEGER NOT NULL,details TEXT NOT NULL,PRIMARY KEY(original,recipe));
+    CREATE INDEX IF NOT EXISTS representations_hash ON representations(hash);
     CREATE TABLE IF NOT EXISTS media_transformations(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,original TEXT NOT NULL,replacement TEXT NOT NULL,policy TEXT NOT NULL,details TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS runtime(key TEXT PRIMARY KEY,value TEXT NOT NULL);
     INSERT OR REPLACE INTO settings VALUES('extensions_version','1');")?;
