@@ -1,9 +1,9 @@
-# tg_backup 2.4.3
+# tg_backup 2.4.4
 
-Fix repeated media reconciliation on large catalogs.
+Fix media reconciliation startup on existing large catalogs.
 
-- Save discovery and reference cursors after each reconciliation batch.
-- Process each existing observation once instead of once per continuous sync pass.
-- Keep new media discovery and reference linking unchanged.
+- Initialize reconciliation cursors at the existing catalog high-water marks.
+- Reconcile only observations added after the upgrade.
+- Resume from the saved batch after an interrupted pass.
 
-The first pass still reconciles existing observations. Later passes only process new observations.
+Existing media references stay unchanged. New observations keep the same discovery and linking checks.

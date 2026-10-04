@@ -2219,10 +2219,17 @@ impl Engine {
     }
     fn reconcile_media(&self) -> Result<()> {
         let a = self.archive.lock().unwrap();
-        let mut after = a
-            .checkpoint("media_discovery_cursor_v1")?
-            .and_then(|v| integer(&v))
-            .unwrap_or(0);
+        let mut after = if let Some(v) = a.checkpoint("media_discovery_cursor_v2")? {
+            integer(&v).unwrap_or(0)
+        } else {
+            let after = a.db.query_row(
+                "SELECT COALESCE(MAX(id),0) FROM observations WHERE kind='media'",
+                [],
+                |r| r.get(0),
+            )?;
+            a.set_checkpoint("media_discovery_cursor_v2", &json!(after))?;
+            after
+        };
         loop {
             let ids: Vec<i64> = a
                 .db
@@ -2239,12 +2246,19 @@ impl Engine {
                 let record = a.record(id)?;
                 discover_media(&a, &record.data, id)?;
             }
-            a.set_checkpoint("media_discovery_cursor_v1", &json!(after))?;
+            a.set_checkpoint("media_discovery_cursor_v2", &json!(after))?;
         }
-        let mut after = a
-            .checkpoint("media_refs_cursor_v1")?
-            .and_then(|v| integer(&v))
-            .unwrap_or(0);
+        let mut after = if let Some(v) = a.checkpoint("media_refs_cursor_v2")? {
+            integer(&v).unwrap_or(0)
+        } else {
+            let after = a.db.query_row(
+                "SELECT COALESCE(MAX(id),0) FROM observations",
+                [],
+                |r| r.get(0),
+            )?;
+            a.set_checkpoint("media_refs_cursor_v2", &json!(after))?;
+            after
+        };
         loop {
             let ids = a.observation_ids(after, 128)?;
             if ids.is_empty() {
@@ -2255,7 +2269,7 @@ impl Engine {
                 let record = a.record(id)?;
                 a.link_media(id, &record.data)?;
             }
-            a.set_checkpoint("media_refs_cursor_v1", &json!(after))?;
+            a.set_checkpoint("media_refs_cursor_v2", &json!(after))?;
         }
         Ok(())
     }
@@ -3463,7 +3477,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn media_reconciliation_resumes_from_saved_cursors() {
+    async fn media_reconciliation_starts_at_catalog_high_water() {
         let dir = tempfile::tempdir().unwrap();
         let e = fixture(dir.path(), Config::default()).await;
         e.capture(
@@ -3481,7 +3495,7 @@ mod tests {
             a.db.query_row("SELECT MAX(id) FROM observations", [], |r| r.get(0))
                 .unwrap();
         assert_eq!(
-            a.checkpoint("media_refs_cursor_v1").unwrap(),
+            a.checkpoint("media_refs_cursor_v2").unwrap(),
             Some(json!(last))
         );
     }
