@@ -2251,11 +2251,10 @@ impl Engine {
         let mut after = if let Some(v) = a.checkpoint("media_refs_cursor_v2")? {
             integer(&v).unwrap_or(0)
         } else {
-            let after = a.db.query_row(
-                "SELECT COALESCE(MAX(id),0) FROM observations",
-                [],
-                |r| r.get(0),
-            )?;
+            let after =
+                a.db.query_row("SELECT COALESCE(MAX(id),0) FROM observations", [], |r| {
+                    r.get(0)
+                })?;
             a.set_checkpoint("media_refs_cursor_v2", &json!(after))?;
             after
         };
