@@ -1,4 +1,4 @@
-# tg_backup 2.5.0
+# tg_backup 2.5.1
 
 Add ClickHouse as an optional storage backend. SQLite remains the default.
 

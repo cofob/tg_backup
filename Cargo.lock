@@ -3391,7 +3391,7 @@ dependencies = [
 
 [[package]]
 name = "tg-backup"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -3429,7 +3429,7 @@ dependencies = [
 
 [[package]]
 name = "tg-backup-client"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3448,7 +3448,7 @@ dependencies = [
 
 [[package]]
 name = "tg-backup-credentials"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "anyhow",
  "rpassword",
@@ -3461,7 +3461,7 @@ dependencies = [
 
 [[package]]
 name = "tg-backup-protocol"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "clap",
  "serde",
@@ -3470,7 +3470,7 @@ dependencies = [
 
 [[package]]
 name = "tg-backup-tui"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "anyhow",
  "blake3",

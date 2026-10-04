@@ -62,7 +62,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           docker run -d --name clickhouse -p 127.0.0.1:8123:8123 -e CLICKHOUSE_SKIP_USER_SETUP=1 clickhouse/clickhouse-server:26.8.2.7
-          for attempt in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if docker exec clickhouse clickhouse-client --query 'SELECT 1'; then break; fi
             sleep 1
           done
