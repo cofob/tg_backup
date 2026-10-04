@@ -141,8 +141,12 @@ fn materialization_waits_for_a_full_block() {
         .unwrap(),
         1
     );
-    a.ingest(&schema, &[item(&"x".repeat(5000), 1_800_000_000_000_001)], None)
-        .unwrap();
+    a.ingest(
+        &schema,
+        &[item(&"x".repeat(5000), 1_800_000_000_000_001)],
+        None,
+    )
+    .unwrap();
     a.materialize_if_ready().unwrap();
     assert_eq!(
         a.db.query_row(
