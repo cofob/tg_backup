@@ -2219,9 +2219,12 @@ impl Engine {
     }
     fn reconcile_media(&self) -> Result<()> {
         let a = self.archive.lock().unwrap();
-        let mut after = 0;
+        let mut after = a
+            .checkpoint("media_discovery_cursor_v1")?
+            .and_then(|v| integer(&v))
+            .unwrap_or(0);
         loop {
-            let ids:Vec<i64>=a.db.prepare("SELECT id FROM observations WHERE id>?1 AND kind='media' AND id NOT IN(SELECT observation FROM media_refs) ORDER BY id LIMIT 128")?.query_map([after],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            let ids:Vec<i64>=a.db.prepare("SELECT id FROM observations WHERE id>?1 AND kind='media' ORDER BY id LIMIT 128")?.query_map([after],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
             if ids.is_empty() {
                 break;
             }
@@ -2230,8 +2233,12 @@ impl Engine {
                 let record = a.record(id)?;
                 discover_media(&a, &record.data, id)?;
             }
+            a.set_checkpoint("media_discovery_cursor_v1", &json!(after))?;
         }
-        let mut after = 0;
+        let mut after = a
+            .checkpoint("media_refs_cursor_v1")?
+            .and_then(|v| integer(&v))
+            .unwrap_or(0);
         loop {
             let ids = a.observation_ids(after, 128)?;
             if ids.is_empty() {
@@ -2242,6 +2249,7 @@ impl Engine {
                 let record = a.record(id)?;
                 a.link_media(id, &record.data)?;
             }
+            a.set_checkpoint("media_refs_cursor_v1", &json!(after))?;
         }
         Ok(())
     }
@@ -3446,6 +3454,28 @@ mod tests {
         drop(a);
         assert!(e.next_pending_media(99).unwrap().is_none());
         assert_eq!(e.next_pending_media(100).unwrap().unwrap().0, "stale");
+    }
+
+    #[tokio::test]
+    async fn media_reconciliation_resumes_from_saved_cursors() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = fixture(dir.path(), Config::default()).await;
+        e.capture(
+            "Message",
+            &e.schema.encode("Message", &message()).unwrap(),
+            "history",
+            Some("user:42"),
+            None,
+            None,
+        )
+        .unwrap();
+        e.reconcile_media().unwrap();
+        let a = e.archive.lock().unwrap();
+        let last: i64 = a
+            .db
+            .query_row("SELECT MAX(id) FROM observations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(a.checkpoint("media_refs_cursor_v1").unwrap(), Some(json!(last)));
     }
 
     #[tokio::test]

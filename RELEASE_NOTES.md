@@ -1,9 +1,9 @@
-# tg_backup 2.4.2
+# tg_backup 2.4.3
 
-Fix media synchronization slowdown on large catalogs.
+Fix repeated media reconciliation on large catalogs.
 
-- Add an ordered partial index for media that needs download.
-- Stop each media chunk from scanning and sorting the full media catalog.
-- Keep retry order and download behavior unchanged.
+- Save discovery and reference cursors after each reconciliation batch.
+- Process each existing observation once instead of once per continuous sync pass.
+- Keep new media discovery and reference linking unchanged.
 
-The first writable startup can take time while SQLite builds the new index. Existing archive data does not change.
+The first pass still reconciles existing observations. Later passes only process new observations.
