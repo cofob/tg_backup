@@ -70,6 +70,8 @@ CREATE INDEX observations_key ON observations(key,id);
 CREATE INDEX observations_time ON observations(observed,id);
 CREATE INDEX observations_kind ON observations(kind,id);
 CREATE INDEX observations_payload ON observations(payload);
+CREATE INDEX observations_epoch_id ON observations(epoch,id);
+CREATE INDEX payloads_pending_epoch ON payloads(epoch) WHERE journal IS NOT NULL;
 CREATE TABLE heads(key TEXT PRIMARY KEY,observation INTEGER NOT NULL REFERENCES observations(id),revision INTEGER NOT NULL,partial INTEGER NOT NULL);
 CREATE VIRTUAL TABLE search USING fts5(text,content='',contentless_delete=1,tokenize='unicode61');
 CREATE VIRTUAL TABLE history_search USING fts5(text,content='',contentless_delete=1,tokenize='unicode61');
@@ -221,7 +223,12 @@ impl Archive {
             .insert(hash.into(), schema.clone());
         Ok(schema)
     }
-    fn epoch(&self, observed: i64, reserved: &HashMap<i64, u64>) -> Result<i64> {
+    fn epoch(
+        &self,
+        observed: i64,
+        reserved: &HashMap<i64, u64>,
+        allocated: &mut HashMap<i64, u64>,
+    ) -> Result<i64> {
         let dt = DateTime::from_timestamp_micros(observed).context("invalid observation time")?;
         let name = self.config.epoch.key(dt);
         if let Some(id) = self
@@ -233,14 +240,21 @@ impl Archive {
             )
             .optional()?
         {
-            let path: String = self.db.query_row("SELECT path FROM epochs WHERE id=?1",[id],|r|r.get(0))?;
-            let epoch = connection(&self.root.join(path), false)?;
-            let pages: u64 = epoch.pragma_query_value(None,"page_count",|r|r.get(0))?;
-            let size: u64 = epoch.pragma_query_value(None,"page_size",|r|r.get(0))?;
-            let high: i64 = epoch.query_row("SELECT COALESCE(MAX(id),0) FROM observations",[],|r|r.get(0))?;
-            let pending: u64 = self.db.query_row("SELECT COALESCE(SUM(length(metadata)*2+length(key)+length(source)+8192),0) FROM observations WHERE epoch=?1 AND id>?2",params![id,high],|r|r.get(0))?;
-            let raw: u64 = self.db.query_row("SELECT COALESCE(SUM(length*2),0) FROM payloads WHERE epoch=?1 AND journal IS NOT NULL",[id],|r|r.get(0))?;
-            if self.config.max_epoch_bytes == 0 || pages*size+pending+raw+reserved.get(&id).copied().unwrap_or(0) < self.config.max_epoch_bytes {
+            let used = if let Some(used) = allocated.get(&id) {
+                *used
+            } else {
+                let path: String = self.db.query_row("SELECT path FROM epochs WHERE id=?1",[id],|r|r.get(0))?;
+                let epoch = connection(&self.root.join(path), false)?;
+                let pages: u64 = epoch.pragma_query_value(None,"page_count",|r|r.get(0))?;
+                let size: u64 = epoch.pragma_query_value(None,"page_size",|r|r.get(0))?;
+                let high: i64 = epoch.query_row("SELECT COALESCE(MAX(id),0) FROM observations",[],|r|r.get(0))?;
+                let pending: u64 = self.db.query_row("SELECT COALESCE(SUM(length(metadata)*2+length(key)+length(source)+8192),0) FROM observations WHERE epoch=?1 AND id>?2",params![id,high],|r|r.get(0))?;
+                let raw: u64 = self.db.query_row("SELECT COALESCE(SUM(length*2),0) FROM payloads WHERE epoch=?1 AND journal IS NOT NULL",[id],|r|r.get(0))?;
+                let used = pages * size + pending + raw;
+                allocated.insert(id, used);
+                used
+            };
+            if self.config.max_epoch_bytes == 0 || used+reserved.get(&id).copied().unwrap_or(0) < self.config.max_epoch_bytes {
                 return Ok(id);
             }
             self.db.execute("UPDATE epochs SET accepting=0 WHERE id=?1",[id])?;
@@ -275,6 +289,7 @@ impl Archive {
         let schema = self.schema(schema_hash)?;
         let mut prepared = Vec::new();
         let mut reserved = HashMap::new();
+        let mut allocated = HashMap::new();
         for c in items {
             ensure!(c.bytes.len() <= MAX_PAYLOAD, "TL payload too large");
             let value = schema.decode(&c.root_type, &c.bytes)?;
@@ -282,7 +297,7 @@ impl Archive {
             hash.update(schema_hash.as_bytes());
             hash.update(c.root_type.as_bytes());
             hash.update(&c.bytes);
-            let epoch = self.epoch(c.observed_at, &reserved)?;
+            let epoch = self.epoch(c.observed_at, &reserved, &mut allocated)?;
             *reserved.entry(epoch).or_insert(0u64) += (c.bytes.len() * 2
                 + c.metadata.to_string().len() * 2
                 + c.key.len()

@@ -115,6 +115,8 @@ pub fn migrate(db: &Connection) -> Result<()> {
     }
     tx.execute_batch("CREATE TABLE IF NOT EXISTS work(sequence INTEGER PRIMARY KEY AUTOINCREMENT,kind TEXT NOT NULL,dedupe TEXT UNIQUE NOT NULL,config TEXT NOT NULL,automatic INTEGER NOT NULL,state TEXT NOT NULL DEFAULT 'queued',created INTEGER NOT NULL,updated INTEGER NOT NULL,retry_at INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,progress TEXT NOT NULL DEFAULT '{}',error TEXT);
     CREATE INDEX IF NOT EXISTS work_state ON work(state,retry_at,sequence);
+    CREATE INDEX IF NOT EXISTS observations_epoch_id ON observations(epoch,id);
+    CREATE INDEX IF NOT EXISTS payloads_pending_epoch ON payloads(epoch) WHERE journal IS NOT NULL;
     CREATE TABLE IF NOT EXISTS representations(original TEXT NOT NULL,hash TEXT NOT NULL,recipe TEXT NOT NULL,bytes INTEGER NOT NULL,created INTEGER NOT NULL,details TEXT NOT NULL,PRIMARY KEY(original,recipe));
     CREATE TABLE IF NOT EXISTS media_transformations(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,original TEXT NOT NULL,replacement TEXT NOT NULL,policy TEXT NOT NULL,details TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS runtime(key TEXT PRIMARY KEY,value TEXT NOT NULL);

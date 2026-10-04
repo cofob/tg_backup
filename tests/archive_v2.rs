@@ -73,6 +73,26 @@ fn journal_recovery_occurrences_and_epoch_sealing() {
     );
 }
 #[test]
+fn catalog_indexes_are_migrated() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Archive::init(dir.path(), &Config::default()).unwrap();
+    a.db
+        .execute_batch("DROP INDEX observations_epoch_id; DROP INDEX payloads_pending_epoch;")
+        .unwrap();
+    drop(a);
+    let a = Archive::open(dir.path(), true).unwrap();
+    for index in ["observations_epoch_id", "payloads_pending_epoch"] {
+        assert!(
+            a.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
+                [index],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+        );
+    }
+}
+#[test]
 fn layers_and_optional_field_retention() {
     let dir = tempfile::tempdir().unwrap();
     let mut a = Archive::init(dir.path(), &Config::default()).unwrap();
