@@ -2224,7 +2224,13 @@ impl Engine {
             .and_then(|v| integer(&v))
             .unwrap_or(0);
         loop {
-            let ids:Vec<i64>=a.db.prepare("SELECT id FROM observations WHERE id>?1 AND kind='media' ORDER BY id LIMIT 128")?.query_map([after],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            let ids: Vec<i64> = a
+                .db
+                .prepare(
+                    "SELECT id FROM observations WHERE id>?1 AND kind='media' ORDER BY id LIMIT 128",
+                )?
+                .query_map([after], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
             if ids.is_empty() {
                 break;
             }
@@ -3475,7 +3481,10 @@ mod tests {
             .db
             .query_row("SELECT MAX(id) FROM observations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(a.checkpoint("media_refs_cursor_v1").unwrap(), Some(json!(last)));
+        assert_eq!(
+            a.checkpoint("media_refs_cursor_v1").unwrap(),
+            Some(json!(last))
+        );
     }
 
     #[tokio::test]
