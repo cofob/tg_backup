@@ -140,6 +140,7 @@ struct Engine {
     job: String,
     options: SyncOptions,
     takeout: Option<i64>,
+    dialog_peers: Option<HashSet<String>>,
     started: Instant,
     base_messages: u64,
     base_media: u64,
@@ -409,6 +410,7 @@ pub async fn sync(root: &Path, mut options: SyncOptions) -> Result<()> {
         job: job.clone(),
         options: options.clone(),
         takeout: None,
+        dialog_peers: None,
         started: Instant::now(),
         base_messages,
         base_media,
@@ -453,6 +455,7 @@ pub async fn sync(root: &Path, mut options: SyncOptions) -> Result<()> {
         job: job.clone(),
         options: options.clone(),
         takeout: None,
+        dialog_peers: None,
         started: Instant::now(),
         base_messages,
         base_media,
@@ -1252,7 +1255,7 @@ impl Engine {
                 "messages.getDialogFilters",
             )
             .await?;
-            self.dialogs().await?;
+            self.dialog_peers = Some(self.dialogs().await?);
             self.refresh_folders()?;
             self.progress("takeout_initialization", 0, None)?;
             self.start_takeout().await?;
@@ -1264,13 +1267,17 @@ impl Engine {
             self.progress("account_collectors", 0, None)?;
             self.account_collectors().await?;
             self.progress("dialogs", 0, None)?;
-            self.dialogs().await?;
+            self.dialog_peers = Some(self.dialogs().await?);
             self.progress("folders", 0, None)?;
             self.refresh_folders()?;
             self.progress("extra_account_collectors", 0, None)?;
             self.extra_account_collectors().await?;
             self.progress("peer_preparation", 0, None)?;
-            let peers = self.peer_list()?;
+            let peers: Vec<_> = self
+                .peer_list()?
+                .into_iter()
+                .filter(|(key, _, _, _)| self.sync_peer(key))
+                .collect();
             self.prepare_extra_peers(&peers)?;
             let total = peers.len() as u64;
             for (index, (key, input, metadata, raw)) in peers.into_iter().enumerate() {
@@ -1379,7 +1386,10 @@ impl Engine {
         };
         let mut flags = json!({"contacts":true});
         let mut files = media_selector.matches(&json!({"category":"account"}));
-        for (_, _, metadata, raw) in self.peer_list()? {
+        for (key, _, metadata, raw) in self.peer_list()? {
+            if !self.sync_peer(&key) {
+                continue;
+            }
             files |= media_selector.may_match(&metadata);
             if !history_selector.may_match(&metadata) && !media_selector.may_match(&metadata) {
                 continue;
@@ -1467,7 +1477,8 @@ impl Engine {
             .map(Some)
             .collect())
     }
-    async fn dialogs(&self) -> Result<()> {
+    async fn dialogs(&self) -> Result<HashSet<String>> {
+        let mut peers = HashSet::new();
         for (range_index, range) in self.ranges().await?.iter().enumerate() {
             for folder_id in [0, 1] {
                 let mut offset_date = 0;
@@ -1489,6 +1500,7 @@ impl Engine {
                     }
                     for dialog in &dialogs {
                         if let Some(key) = peer_key(&dialog["peer"]) {
+                            peers.insert(key.clone());
                             let a = self.archive.lock().unwrap();
                             if let Some(mut meta) = peer_metadata(&a, &key)? {
                                 meta["archived"] = json!(integer(&dialog["folder_id"]) == Some(1));
@@ -1534,7 +1546,12 @@ impl Engine {
                 }
             }
         }
-        Ok(())
+        Ok(peers)
+    }
+    fn sync_peer(&self, key: &str) -> bool {
+        self.dialog_peers
+            .as_ref()
+            .is_none_or(|peers| peers.contains(key))
     }
     fn input_peer(&self, key: &str) -> Result<Value> {
         let s: String = self.archive.lock().unwrap().db.query_row(
@@ -1576,6 +1593,9 @@ impl Engine {
                 .collect::<rusqlite::Result<_>>()?;
         drop(a);
         for (key, _, mut metadata, _) in self.peer_list()? {
+            if !self.sync_peer(&key) {
+                continue;
+            }
             let mut folders = vec![];
             for raw in &filters {
                 let filter: Value = serde_json::from_str(raw)?;
@@ -2348,6 +2368,16 @@ impl Engine {
                 Selector::parse(&self.archive.lock().unwrap().config.attachment_selector)?;
             if !metadata.iter().any(|m| {
                 serde_json::from_str::<Value>(m).is_ok_and(|mut m| {
+                    let peer = m["peer"].as_str().or_else(|| {
+                        m["scope"].as_str()?.split('/').find(|part| {
+                            part.starts_with("user:")
+                                || part.starts_with("chat:")
+                                || part.starts_with("channel:")
+                        })
+                    });
+                    if peer.is_some_and(|peer| !self.sync_peer(peer)) {
+                        return false;
+                    }
                     if let Some(peer) = m["peer"].as_str()
                         && let Ok(Some(current)) =
                             peer_metadata(&self.archive.lock().unwrap(), peer)
@@ -2359,7 +2389,7 @@ impl Engine {
             }) {
                 self.archive.lock().unwrap().media_error(
                     &id,
-                    "attachment selector excludes source",
+                    "sync scope or attachment selector excludes source",
                     Utc::now().timestamp() + 3600,
                 )?;
                 self.archive
@@ -3129,6 +3159,7 @@ mod tests {
             job: "fixture".into(),
             options: SyncOptions::default(),
             takeout: None,
+            dialog_peers: None,
             started: Instant::now(),
             base_messages: 0,
             base_media: 0,
@@ -3243,11 +3274,12 @@ mod tests {
     fn queue_cycle(e: &Engine, fail_first: bool, limit: u64, download: bool) {
         let mut queue = e.mock_rpc.as_ref().unwrap().lock().unwrap();
         for folder_id in [0, 1] {
+            let id = 42 + folder_id;
             queue.push_back(MockReply {
                 method: "messages.getDialogs",
                 args: json!({"folder_id":folder_id,"offset_date":0,"offset_id":0,"offset_peer":{"_":"inputPeerEmpty"},"limit":100,"hash":"0"}),
                 dc: None,
-                result: Ok(json!({"_":"messages.dialogs","dialogs":[],"messages":[],"chats":[],"users":[]})),
+                result: Ok(json!({"_":"messages.dialogs","dialogs":[{"_":"dialog","peer":{"_":"peerUser","user_id":id.to_string()},"top_message":17,"read_inbox_max_id":0,"read_outbox_max_id":0,"unread_count":0,"unread_mentions_count":0,"unread_reactions_count":0,"unread_poll_votes_count":0,"notify_settings":{"_":"peerNotifySettings"},"folder_id":folder_id}],"messages":[],"chats":[],"users":[]})),
             });
         }
         for id in [42, 43] {
@@ -3285,6 +3317,87 @@ mod tests {
                 result: Ok(json!({"_":"upload.file","type":{"_":"storage.fileUnknown"},"mtime":0,"bytes":{"$bytes":hex::encode(&b"test"[offset as usize..])}})),
             });
         }
+    }
+    #[tokio::test]
+    async fn run_uses_dialogs_not_related_cached_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = run_fixture(dir.path()).await;
+        let channel = json!({"_":"channel","id":"99","access_hash":"999","title":"Referenced channel","broadcast":true,"left":true,"photo":{"_":"chatPhotoEmpty"},"date":0});
+        cache_peer(&e.archive.lock().unwrap(), &channel, 1).unwrap();
+        let mut other = channel.clone();
+        other["id"] = json!("100");
+        other["left"] = json!(false);
+        cache_peer(&e.archive.lock().unwrap(), &other, 1).unwrap();
+        let mut unrelated = message();
+        unrelated["peer_id"] = json!({"_":"peerChannel","channel_id":"99"});
+        unrelated["media"]["photo"]["id"] = json!("124");
+        e.capture(
+            "Message",
+            &e.schema.encode("Message", &unrelated).unwrap(),
+            "history",
+            Some("channel:99"),
+            None,
+            None,
+        )
+        .unwrap();
+        queue_cycle(&e, false, 100, true);
+        {
+            let mut queue = e.mock_rpc.as_ref().unwrap().lock().unwrap();
+            queue[0].result.as_mut().unwrap()["chats"] = json!([channel, other]);
+            let mut forwarded = message();
+            forwarded["fwd_from"] = json!({"_":"messageFwdHeader","from_id":{"_":"peerChannel","channel_id":"99"},"date":1700000000});
+            queue[2].result.as_mut().unwrap()["messages"] = json!([forwarded]);
+        }
+        e.run().await.unwrap();
+        let a = e.archive.lock().unwrap();
+        assert!(peer_metadata(&a, "channel:99").unwrap().is_some());
+        assert!(
+            a.checkpoint("history_success:channel:99")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            a.checkpoint("history_success:channel:100")
+                .unwrap()
+                .is_none()
+        );
+        assert!(a.checkpoint("history_success:user:42").unwrap().is_some());
+        assert!(a.checkpoint("history_success:user:43").unwrap().is_some());
+        let status: String =
+            a.db.query_row("SELECT status FROM media WHERE id='photo:124:x'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "deferred");
+        let status: String =
+            a.db.query_row("SELECT status FROM media WHERE id='photo:123:x'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "complete");
+        a.verify().unwrap();
+    }
+    #[tokio::test]
+    async fn continuous_run_drops_peers_removed_from_dialogs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = run_fixture(dir.path()).await;
+        e.options.continuous = true;
+        queue_cycle(&e, false, 100, true);
+        queue_cycle(&e, false, 100, false);
+        {
+            let mut queue = e.mock_rpc.as_ref().unwrap().lock().unwrap();
+            queue[8].result.as_mut().unwrap()["dialogs"] = json!([]);
+            queue.truncate(11);
+        }
+        assert!(
+            e.run()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("sync interrupted")
+        );
+        assert!(!e.sync_peer("user:43"));
+        assert!(e.sync_peer("user:42"));
     }
     #[tokio::test]
     async fn run_scans_all_history_before_resuming_media() {

@@ -938,6 +938,9 @@ impl Engine {
     }
 
     fn extra_peer_selected(&self, peer: &str) -> Result<bool> {
+        if !self.sync_peer(peer) {
+            return Ok(false);
+        }
         let a = self.archive.lock().unwrap();
         let Some(metadata) = peer_metadata(&a, peer)? else {
             return Ok(false);
