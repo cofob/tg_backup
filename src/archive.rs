@@ -79,6 +79,7 @@ CREATE TABLE checkpoints(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE jobs(id TEXT PRIMARY KEY,config TEXT NOT NULL,status TEXT NOT NULL,created INTEGER NOT NULL,updated INTEGER NOT NULL,details TEXT NOT NULL);
 CREATE TABLE coverage(name TEXT PRIMARY KEY,status TEXT NOT NULL,updated INTEGER NOT NULL,details TEXT NOT NULL);
 CREATE TABLE media(id TEXT PRIMARY KEY,location TEXT NOT NULL,dc INTEGER NOT NULL,size INTEGER,status TEXT NOT NULL DEFAULT 'pending',offset INTEGER NOT NULL DEFAULT 0,hash TEXT,error TEXT,attempts INTEGER NOT NULL DEFAULT 0,retry_at INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX media_pending ON media(attempts,id,retry_at) WHERE status!='complete' AND status!='unavailable';
 CREATE TABLE media_refs(media TEXT NOT NULL REFERENCES media(id),observation INTEGER NOT NULL REFERENCES observations(id),PRIMARY KEY(media,observation));
 CREATE TABLE maintenance(id TEXT PRIMARY KEY,at INTEGER NOT NULL,policy TEXT NOT NULL,report TEXT NOT NULL);
 CREATE TABLE retired(path TEXT PRIMARY KEY);

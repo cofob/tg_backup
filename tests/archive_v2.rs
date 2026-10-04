@@ -76,11 +76,15 @@ fn journal_recovery_occurrences_and_epoch_sealing() {
 fn catalog_indexes_are_migrated() {
     let dir = tempfile::tempdir().unwrap();
     let a = Archive::init(dir.path(), &Config::default()).unwrap();
-    a.db.execute_batch("DROP INDEX observations_epoch_id; DROP INDEX payloads_pending_epoch;")
+    a.db.execute_batch("DROP INDEX observations_epoch_id; DROP INDEX payloads_pending_epoch; DROP INDEX media_pending;")
         .unwrap();
     drop(a);
     let a = Archive::open(dir.path(), true).unwrap();
-    for index in ["observations_epoch_id", "payloads_pending_epoch"] {
+    for index in [
+        "observations_epoch_id",
+        "payloads_pending_epoch",
+        "media_pending",
+    ] {
         assert!(
             a.db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
@@ -90,6 +94,15 @@ fn catalog_indexes_are_migrated() {
             .unwrap()
         );
     }
+    let plan: String = a
+        .db
+        .query_row(
+            "EXPLAIN QUERY PLAN SELECT id FROM media WHERE status!='complete' AND status!='unavailable' AND retry_at<=0 ORDER BY attempts,id LIMIT 1",
+            [],
+            |r| r.get(3),
+        )
+        .unwrap();
+    assert!(plan.contains("media_pending"), "unexpected plan: {plan}");
 }
 #[test]
 fn layers_and_optional_field_retention() {
