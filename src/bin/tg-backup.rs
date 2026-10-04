@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tg_backup::{
     archive::{Archive, Maintenance, Retention},
-    config::{Config, EpochPeriod},
+    config::{Backend, Config, EpochPeriod},
     export::Format,
     query::Query,
 };
@@ -11,7 +11,7 @@ use tg_backup::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "Archive Telegram cloud data as native TL in compressed SQLite epochs"
+    about = "Archive Telegram cloud data as native TL in SQLite or ClickHouse"
 )]
 struct Cli {
     #[arg(long, global = true, default_value = "dataset")]
@@ -28,7 +28,13 @@ enum Command {
     Init {
         #[arg(long, value_enum, default_value = "monthly")]
         epoch: EpochPeriod,
+        #[arg(long, value_enum, default_value = "sqlite")]
+        backend: Backend,
+        #[command(flatten)]
+        connection: tg_backup::migration::ConnectionOptions,
     },
+    /// Copy a fixed snapshot to a separate dataset.
+    Migrate(tg_backup::migration::Options),
     Setup(tg_backup::setup::Options),
     Run,
     Worker {
@@ -141,17 +147,27 @@ async fn main() -> Result<()> {
             }))
             .await?
         }
-        Command::Init { epoch } => {
+        Command::Init {
+            epoch,
+            backend,
+            connection,
+        } => {
             let a = Archive::init(
                 &cli.dataset,
-                &Config {
-                    epoch,
-                    ..Default::default()
-                },
+                &connection.config(
+                    backend,
+                    Config {
+                        epoch,
+                        ..Default::default()
+                    },
+                )?,
             )?;
             print(&a.status()?)?;
         }
         Command::Setup(options) => tg_backup::setup::run(&cli.dataset, options).await?,
+        Command::Migrate(options) => {
+            print(&tg_backup::migration::run_cli(&cli.dataset, &options)?)?
+        }
         Command::WorkerService { socket } => tg_backup::work::service(cli.dataset, socket).await?,
         Command::WorkerTask => {
             if let Err(error) = tg_backup::transcode::worker(&cli.dataset) {

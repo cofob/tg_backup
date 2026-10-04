@@ -73,7 +73,33 @@ pub fn snapshot(a: &Archive) -> Result<String> {
             "SELECT COALESCE(SUM(bytes),0) FROM representations",
         ),
     ] {
-        let value: i64 = a.db.query_row(sql, [], |r| r.get(0))?;
+        let value: i64 = if let Some(db) = a.store.clickhouse() {
+            let mut sql = sql.replace("journal IS NOT NULL", "length(journal)>0");
+            for table in [
+                "observations",
+                "heads",
+                "payloads",
+                "media",
+                "coverage",
+                "work",
+                "representations",
+            ] {
+                sql = sql.replace(
+                    &format!("FROM {table}"),
+                    &format!("FROM {}", db.source(table, crate::storage::CATALOG)?),
+                );
+            }
+            let (expression, source) = sql
+                .strip_prefix("SELECT ")
+                .and_then(|s| s.split_once(" FROM "))
+                .ok_or_else(|| anyhow::anyhow!("invalid metric"))?;
+            db.number(
+                format!("SELECT toInt64({expression}) AS value FROM {source}"),
+                vec![],
+            )?
+        } else {
+            a.store.sqlite()?.query_row(sql, [], |r| r.get(0))?
+        };
         out += &format!("# TYPE tg_backup_{name} gauge\ntg_backup_{name} {value}\n");
     }
     out += &format!(

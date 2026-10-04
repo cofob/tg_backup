@@ -9,6 +9,21 @@ x-rootless: &rootless
   tmpfs:
     - /tmp:rw,noexec,nosuid,nodev,size=64m
 services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.8.2.7
+    profiles: [clickhouse]
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_USER: tg_backup
+      CLICKHOUSE_PASSWORD: ${TG_BACKUP_CLICKHOUSE_PASSWORD:-}
+    volumes:
+      - clickhouse:/var/lib/clickhouse
+    ports:
+      - 127.0.0.1:8123:8123
+    healthcheck:
+      test: [CMD, wget, --quiet, --spider, http://localhost:8123/ping]
+      interval: 5s
+      timeout: 2s
   setup:
     <<: *rootless
     image: ghcr.io/cofob/tg-backup:latest
@@ -70,5 +85,6 @@ services:
       interval: 5s
       timeout: 2s
 volumes:
+  clickhouse:
   archive:
   control:

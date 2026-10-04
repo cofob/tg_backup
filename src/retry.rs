@@ -14,6 +14,45 @@ pub enum Target {
 impl Archive {
     pub fn retry_failed(&mut self, target: Target, apply: bool) -> Result<Value> {
         ensure!(!apply || self.writable, "read-only archive");
+        if self.store.clickhouse().is_some() {
+            use crate::storage::{CATALOG, Select, rows::*};
+            let mut changes = vec![];
+            let mut found = (0, 0);
+            if matches!(target, Target::All | Target::Work) {
+                for mut row in self
+                    .store
+                    .select::<WorkRow>(&Select::eq("state", "failed"))?
+                {
+                    found.0 += 1;
+                    row.state = "queued".into();
+                    row.attempts = 0;
+                    row.retry_at = 0;
+                    row.error = None;
+                    row.progress = "{}".into();
+                    row.updated = chrono::Utc::now().timestamp_micros();
+                    changes.push(Change::put(CATALOG, &row)?);
+                }
+            }
+            if matches!(target, Target::All | Target::Attachments) {
+                for mut row in self
+                    .store
+                    .select::<MediaRow>(&Select::eq("status", "failed"))?
+                {
+                    found.1 += 1;
+                    row.status = "pending".into();
+                    row.attempts = 0;
+                    row.retry_at = 0;
+                    row.error = None;
+                    changes.push(Change::put(CATALOG, &row)?);
+                }
+            }
+            if apply {
+                self.store.batch(changes)?;
+            }
+            return Ok(
+                json!({"target":target,"apply":apply,"found":{"work":found.0,"attachments":found.1},"changed":{"work":if apply { found.0 } else { 0 },"attachments":if apply { found.1 } else { 0 }}}),
+            );
+        }
         // A read-only Archive already holds a snapshot transaction.
         let counts = |db: &rusqlite::Connection| -> Result<(i64, i64)> {
             Ok((
@@ -36,7 +75,7 @@ impl Archive {
             ))
         };
         let (found, changed) = if apply {
-            let tx = self.db.transaction()?;
+            let tx = self.store.sqlite_mut()?.transaction()?;
             let found = counts(&tx)?;
             let work = if matches!(target, Target::All | Target::Work) {
                 tx.execute("UPDATE work SET state='queued',attempts=0,retry_at=0,error=NULL,progress='{}',updated=?1 WHERE state='failed'",[chrono::Utc::now().timestamp_micros()])?
@@ -51,7 +90,7 @@ impl Archive {
             tx.commit()?;
             (found, (work, attachments))
         } else {
-            (counts(&self.db)?, (0, 0))
+            (counts(self.store.sqlite()?)?, (0, 0))
         };
         Ok(
             json!({"target":target,"apply":apply,"found":{"work":found.0,"attachments":found.1},"changed":{"work":changed.0,"attachments":changed.1}}),

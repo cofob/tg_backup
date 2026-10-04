@@ -1,10 +1,15 @@
-# tg_backup 2.4.8
+# tg_backup 2.5.0
 
-Sync current dialogs, not every peer seen in Telegram responses.
+Add ClickHouse as an optional storage backend. SQLite remains the default.
 
-- Keep normal and archived dialogs in the sync scope.
-- Do not scan history or enrich unrelated cached channels.
-- Defer queued files from unrelated chats, but keep forwarded files from current dialogs.
-- Refresh the dialog scope in each continuous cycle and after resume.
+- Use `--backend clickhouse` with `init` or `setup`. Both backends support sync, queries, exports, the TUI, and the work queue.
+- Migrate in either direction with `migrate --to sqlite|clickhouse --output TARGET`. Use `--resume` after interruption.
+- Show migration progress on terminal stderr and keep JSON on stdout. Verify the target before it becomes ready and leave source files unchanged.
+- Publish ClickHouse data and checkpoints with durable batch intents and commit records. Recover pending batches before new writes.
+- Use native ClickHouse text indexes with Unicode tokens, case normalization, and quoted phrases. SQLite keeps FTS5 search.
+- Keep Telegram sessions in local `session.sqlite3` files. Copy sessions, credentials, media, and queue state during migration.
+- Add a pinned ClickHouse Compose profile and update setup, backup, and restore instructions.
 
-This release keeps the history-before-media order from 2.4.7. Existing archive data is not removed.
+Requires Rust 1.89 or newer and ClickHouse 26.8.2.7 or newer for that backend. SQLite needs no ClickHouse server. Migration needs temporary disk space for local SQLite database copies.
+
+This release keeps the dialog-scope fix from 2.4.8 and the history-before-media order from 2.4.7.

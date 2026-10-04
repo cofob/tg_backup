@@ -49,7 +49,10 @@ fn journal_recovery_occurrences_and_epoch_sealing() {
         3
     );
     assert_eq!(
-        a.db.query_row("SELECT COUNT(*) FROM payloads", [], |r| r.get::<_, i64>(0))
+        a.store
+            .sqlite()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM payloads", [], |r| r.get::<_, i64>(0))
             .unwrap(),
         2
     );
@@ -76,7 +79,7 @@ fn journal_recovery_occurrences_and_epoch_sealing() {
 fn catalog_indexes_are_migrated() {
     let dir = tempfile::tempdir().unwrap();
     let a = Archive::init(dir.path(), &Config::default()).unwrap();
-    a.db.execute_batch("DROP INDEX observations_epoch_id; DROP INDEX payloads_pending_epoch; DROP INDEX media_pending; DROP INDEX representations_hash;")
+    a.store.sqlite().unwrap().execute_batch("DROP INDEX observations_epoch_id; DROP INDEX payloads_pending_epoch; DROP INDEX media_pending; DROP INDEX representations_hash;")
         .unwrap();
     drop(a);
     let a = Archive::open(dir.path(), true).unwrap();
@@ -87,16 +90,19 @@ fn catalog_indexes_are_migrated() {
         "representations_hash",
     ] {
         assert!(
-            a.db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
-                [index],
-                |r| r.get::<_, bool>(0)
-            )
-            .unwrap()
+            a.store
+                .sqlite()
+                .unwrap()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
+                    [index],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap()
         );
     }
     let plan: String = a
-        .db
+        .store.sqlite().unwrap()
         .query_row(
             "EXPLAIN QUERY PLAN SELECT id FROM media WHERE status!='complete' AND status!='unavailable' AND retry_at<=0 ORDER BY attempts,id LIMIT 1",
             [],
@@ -105,7 +111,9 @@ fn catalog_indexes_are_migrated() {
         .unwrap();
     assert!(plan.contains("media_pending"), "unexpected plan: {plan}");
     let plan: Vec<String> = a
-        .db
+        .store
+        .sqlite()
+        .unwrap()
         .prepare("EXPLAIN QUERY PLAN SELECT * FROM representations WHERE original='x' OR hash='x'")
         .unwrap()
         .query_map([], |r| r.get(3))
@@ -133,12 +141,15 @@ fn materialization_waits_for_a_full_block() {
         .unwrap();
     a.materialize_if_ready().unwrap();
     assert_eq!(
-        a.db.query_row(
-            "SELECT COUNT(*) FROM payloads WHERE journal IS NOT NULL",
-            [],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
+        a.store
+            .sqlite()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM payloads WHERE journal IS NOT NULL",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
         1
     );
     a.ingest(
@@ -149,12 +160,15 @@ fn materialization_waits_for_a_full_block() {
     .unwrap();
     a.materialize_if_ready().unwrap();
     assert_eq!(
-        a.db.query_row(
-            "SELECT COUNT(*) FROM payloads WHERE journal IS NOT NULL",
-            [],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
+        a.store
+            .sqlite()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM payloads WHERE journal IS NOT NULL",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
         0
     );
 }

@@ -1,4 +1,8 @@
 use crate::archive::{Archive, sync_dir};
+use crate::storage::{
+    Select,
+    rows::{MediaRefRow, MediaRow},
+};
 use anyhow::{Context, Result, ensure};
 use rusqlite::params;
 use serde_json::Value;
@@ -41,8 +45,26 @@ impl Archive {
         size: Option<u64>,
         observation: i64,
     ) -> Result<()> {
-        self.db.execute("INSERT INTO media(id,location,dc,size) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET location=excluded.location,dc=excluded.dc,size=COALESCE(excluded.size,media.size)",params![id,location.to_string(),dc,size])?;
-        self.db.execute(
+        if self.store.clickhouse().is_some() {
+            let mut row = self.store.get::<MediaRow>("id", id)?.unwrap_or(MediaRow {
+                id: id.into(),
+                status: "pending".into(),
+                ..Default::default()
+            });
+            row.location = location.to_string();
+            row.dc = i64::from(dc);
+            if let Some(size) = size {
+                row.size = Some(i64::try_from(size)?);
+            }
+            self.store.put(&row)?;
+            self.store.put(&MediaRefRow {
+                media: id.into(),
+                observation,
+            })?;
+            return Ok(());
+        }
+        self.store.sqlite()?.execute("INSERT INTO media(id,location,dc,size) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET location=excluded.location,dc=excluded.dc,size=COALESCE(excluded.size,media.size)",params![id,location.to_string(),dc,size])?;
+        self.store.sqlite()?.execute(
             "INSERT OR IGNORE INTO media_refs VALUES(?1,?2)",
             params![id, observation],
         )?;
@@ -65,18 +87,17 @@ impl Archive {
         f.write_all(bytes)?;
         f.sync_all()?;
         let new = offset + bytes.len() as u64;
-        self.db.execute(
-            "UPDATE media SET offset=?2,status='downloading',error=NULL WHERE id=?1",
-            params![id, new],
-        )?;
+        self.update_media(id, |row| {
+            row.offset = new as i64;
+            row.status = "downloading".into();
+            row.error = None;
+        })?;
         Ok(new)
     }
     pub fn finish_media(&self, id: &str) -> Result<String> {
         let path = stage_path(&self.root, id);
         let len = fs::metadata(&path)?.len();
-        let expected: Option<u64> =
-            self.db
-                .query_row("SELECT size FROM media WHERE id=?1", [id], |r| r.get(0))?;
+        let expected = self.media(id)?.size.map(u64::try_from).transpose()?;
         if let Some(expected) = expected {
             ensure!(
                 len == expected,
@@ -96,18 +117,21 @@ impl Archive {
             File::open(&dest)?.sync_all()?;
             sync_dir(dest.parent().unwrap())?;
         }
-        self.db.execute(
-            "UPDATE media SET hash=?2,status='complete',offset=?3,error=NULL WHERE id=?1",
-            params![id, hash, len],
-        )?;
+        self.update_media(id, |row| {
+            row.hash = Some(hash.clone());
+            row.status = "complete".into();
+            row.offset = len as i64;
+            row.error = None;
+        })?;
         Ok(hash)
     }
     pub fn media_error(&self, id: &str, error: &str, retry_at: i64) -> Result<()> {
-        self.db.execute(
-            "UPDATE media SET status='failed',attempts=attempts+1,error=?2,retry_at=?3 WHERE id=?1",
-            params![id, error, retry_at],
-        )?;
-        Ok(())
+        self.update_media(id, |row| {
+            row.status = "failed".into();
+            row.attempts += 1;
+            row.error = Some(error.into());
+            row.retry_at = retry_at;
+        })
     }
 }
 
@@ -143,7 +167,25 @@ impl Archive {
         let mut ids = std::collections::BTreeSet::new();
         identities(value, &mut ids);
         for id in ids {
-            self.db.execute(
+            if self.store.clickhouse().is_some() {
+                let prefix = id.strip_suffix('*');
+                let rows = if let Some(prefix) = prefix {
+                    self.store.select::<MediaRow>(
+                        &Select::eq("id", format!("{prefix}%")).with_operator("LIKE"),
+                    )?
+                } else {
+                    self.store
+                        .select::<MediaRow>(&Select::eq("id", id.clone()))?
+                };
+                for row in rows {
+                    self.store.put(&MediaRefRow {
+                        media: row.id,
+                        observation,
+                    })?;
+                }
+                continue;
+            }
+            self.store.sqlite()?.execute(
                 "INSERT OR IGNORE INTO media_refs SELECT id,?1 FROM media WHERE id GLOB ?2",
                 params![observation, id],
             )?;
@@ -155,8 +197,21 @@ impl Archive {
         identities(value, &mut ids);
         let mut hashes = std::collections::BTreeSet::new();
         for id in ids {
+            if self.store.clickhouse().is_some() {
+                let rows = if let Some(prefix) = id.strip_suffix('*') {
+                    self.store.select::<MediaRow>(
+                        &Select::eq("id", format!("{prefix}%")).with_operator("LIKE"),
+                    )?
+                } else {
+                    self.store
+                        .select::<MediaRow>(&Select::eq("id", id.clone()))?
+                };
+                hashes.extend(rows.into_iter().filter_map(|row| row.hash));
+                continue;
+            }
             let mut st = self
-                .db
+                .store
+                .sqlite()?
                 .prepare("SELECT hash FROM media WHERE id GLOB ?1 AND status='complete'")?;
             for hash in st.query_map([id], |r| r.get::<_, String>(0))? {
                 hashes.insert(hash?);

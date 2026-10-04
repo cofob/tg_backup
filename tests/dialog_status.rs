@@ -47,7 +47,9 @@ fn fixture() -> tempfile::TempDir {
     let schema = Schema::current().unwrap();
     let schema_hash = archive.register_schema(tl::LAYER, tl::API_SCHEMA).unwrap();
     archive
-        .db
+        .store
+        .sqlite()
+        .unwrap()
         .execute_batch("CREATE TABLE peers(key TEXT PRIMARY KEY,input TEXT,metadata TEXT,raw TEXT)")
         .unwrap();
     for (key, raw) in [
@@ -71,7 +73,9 @@ fn fixture() -> tempfile::TempDir {
         ),
     ] {
         archive
-            .db
+            .store
+            .sqlite()
+            .unwrap()
             .execute(
                 "INSERT INTO peers VALUES(?1,'{}',?2,?3)",
                 rusqlite::params![key, json!({"title":"STALE"}).to_string(), raw.to_string()],
@@ -84,7 +88,9 @@ fn fixture() -> tempfile::TempDir {
         .collect::<Vec<_>>();
     archive.ingest(&schema_hash, &dialogs, None).unwrap();
     archive
-        .db
+        .store
+        .sqlite()
+        .unwrap()
         .execute(
             "UPDATE peers SET metadata=?1 WHERE key='user:6'",
             [json!({"archived":true,"contact":true}).to_string()],
@@ -304,7 +310,7 @@ fn exact_page_boundary_and_sparse_filtered_pages() {
     let schema_hash = archive.register_schema(tl::LAYER, tl::API_SCHEMA).unwrap();
     let mut dialogs = Vec::new();
     {
-        let transaction = archive.db.transaction().unwrap();
+        let transaction = archive.store.sqlite_mut().unwrap().transaction().unwrap();
         for id in 1000..1260 {
             let key = format!("user:{id}");
             transaction

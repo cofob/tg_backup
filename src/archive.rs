@@ -1,5 +1,6 @@
 use crate::{
-    config::Config,
+    config::{Backend, Config},
+    storage::{CATALOG as CATALOG_SCOPE, ClickHouseStore, Storage, rows::*},
     tl::{self, Schema},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -38,7 +39,7 @@ type PayloadLocation = (
 );
 pub struct Archive {
     pub root: PathBuf,
-    pub db: Connection,
+    pub store: crate::storage::Storage,
     pub config: Config,
     pub writable: bool,
     schemas: std::cell::RefCell<HashMap<String, std::sync::Arc<Schema>>>,
@@ -59,7 +60,7 @@ pub struct Capture {
     pub deleted: bool,
 }
 pub use tg_backup_protocol::Record;
-const CATALOG: &str = r#"
+pub(crate) const CATALOG: &str = r#"
 PRAGMA user_version=2;
 CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE schemas(hash TEXT PRIMARY KEY,layer INTEGER NOT NULL,definition TEXT NOT NULL);
@@ -84,7 +85,7 @@ CREATE TABLE media_refs(media TEXT NOT NULL REFERENCES media(id),observation INT
 CREATE TABLE maintenance(id TEXT PRIMARY KEY,at INTEGER NOT NULL,policy TEXT NOT NULL,report TEXT NOT NULL);
 CREATE TABLE retired(path TEXT PRIMARY KEY);
 "#;
-const EPOCH: &str = r#"
+pub(crate) const EPOCH: &str = r#"
 PRAGMA user_version=2;
 CREATE TABLE schemas(hash TEXT PRIMARY KEY,layer INTEGER NOT NULL,definition TEXT NOT NULL);
 CREATE TABLE dictionaries(id INTEGER PRIMARY KEY,data BLOB NOT NULL,hash TEXT NOT NULL);
@@ -93,7 +94,7 @@ CREATE TABLE payloads(hash TEXT PRIMARY KEY,schema_hash TEXT NOT NULL,root_type 
 CREATE TABLE observations(id INTEGER PRIMARY KEY,key TEXT NOT NULL,kind TEXT NOT NULL,observed INTEGER NOT NULL,source TEXT NOT NULL,payload TEXT NOT NULL,metadata TEXT NOT NULL,partial INTEGER NOT NULL,deleted INTEGER NOT NULL,transformed INTEGER NOT NULL,replay_key TEXT);
 CREATE INDEX observations_key ON observations(key,id);
 "#;
-fn connection(path: &Path, write: bool) -> Result<Connection> {
+pub(crate) fn connection(path: &Path, write: bool) -> Result<Connection> {
     let flags = if write {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
     } else {
@@ -130,7 +131,7 @@ impl Archive {
     pub fn init(root: &Path, config: &Config) -> Result<Self> {
         fs::create_dir_all(root)?;
         ensure!(
-            !root.join("catalog.sqlite3").exists(),
+            !root.join("catalog.sqlite3").exists() && !root.join("config.toml").exists(),
             "dataset already exists"
         );
         for dir in ["epochs", "attachments", "staging"] {
@@ -145,14 +146,56 @@ impl Archive {
             File::create(root.join(name))?.sync_all()?;
         }
         let _lock = lock(root, true)?;
-        fs::write(root.join("config.toml"), toml::to_string_pretty(config)?)?;
+        let mut config = config.clone();
+        let dataset_id = uuid::Uuid::new_v4().to_string();
+        config.dataset_id = Some(dataset_id.clone());
+        if config.backend == Backend::Clickhouse {
+            let options = config
+                .clickhouse
+                .as_ref()
+                .context("ClickHouse configuration is missing")?;
+            let db = ClickHouseStore::connect(options, true)?;
+            db.init(&options.database)?;
+            let schema = blake3::hash(tl::API_SCHEMA.as_bytes()).to_hex().to_string();
+            db.commit(vec![
+                Change::put(
+                    CATALOG_SCOPE,
+                    &Setting {
+                        key: "dataset_id".into(),
+                        value: dataset_id,
+                    },
+                )?,
+                Change::put(
+                    CATALOG_SCOPE,
+                    &SchemaRow {
+                        hash: schema,
+                        layer: i64::from(tl::LAYER),
+                        definition: tl::API_SCHEMA.into(),
+                    },
+                )?,
+            ])?;
+            tg_backup_credentials::private_write(
+                &root.join("config.toml"),
+                toml::to_string_pretty(&config)?.as_bytes(),
+            )?;
+            return Ok(Self {
+                root: root.into(),
+                store: Storage::ClickHouse(Box::new(db)),
+                config,
+                writable: true,
+                schemas: Default::default(),
+                blocks: Default::default(),
+                _lock,
+            });
+        }
+        tg_backup_credentials::private_write(
+            &root.join("config.toml"),
+            toml::to_string_pretty(&config)?.as_bytes(),
+        )?;
         let db = connection(&root.join("catalog.sqlite3"), true)?;
         db.execute_batch(CATALOG)?;
         crate::work::migrate(&db)?;
-        db.execute(
-            "INSERT INTO settings VALUES('dataset_id',?1)",
-            [uuid::Uuid::new_v4().to_string()],
-        )?;
+        db.execute("INSERT INTO settings VALUES('dataset_id',?1)", [dataset_id])?;
         let schema_hash = blake3::hash(tl::API_SCHEMA.as_bytes()).to_hex().to_string();
         db.execute(
             "INSERT INTO schemas VALUES(?1,?2,?3)",
@@ -160,8 +203,8 @@ impl Archive {
         )?;
         Ok(Self {
             root: root.into(),
-            db,
-            config: config.clone(),
+            store: crate::storage::Storage::Sqlite(db),
+            config,
             writable: true,
             schemas: Default::default(),
             blocks: Default::default(),
@@ -169,7 +212,50 @@ impl Archive {
         })
     }
     pub fn open(root: &Path, write: bool) -> Result<Self> {
+        ensure!(
+            !root.join("migration.json").exists(),
+            "migration is incomplete; use migrate --resume"
+        );
+        Self::open_inner(root, write, false)
+    }
+    pub(crate) fn open_migration(root: &Path) -> Result<Self> {
+        Self::open_inner(root, true, true)
+    }
+    fn open_inner(root: &Path, write: bool, migration: bool) -> Result<Self> {
+        let config = Config::load(root)?;
         let _lock = lock(root, write)?;
+        if config.backend == Backend::Clickhouse {
+            let db = ClickHouseStore::connect(
+                config
+                    .clickhouse
+                    .as_ref()
+                    .context("ClickHouse configuration is missing")?,
+                write,
+            )?;
+            db.open()?;
+            let id = db.select::<Setting>(
+                CATALOG_SCOPE,
+                &crate::storage::Select::eq("key", "dataset_id"),
+            )?;
+            ensure!(
+                id.first().map(|v| v.value.as_str()) == config.dataset_id.as_deref(),
+                "ClickHouse dataset ID does not match"
+            );
+            let mut a = Self {
+                root: root.into(),
+                store: Storage::ClickHouse(Box::new(db)),
+                config,
+                writable: write,
+                schemas: Default::default(),
+                blocks: Default::default(),
+                _lock,
+            };
+            if write && !migration {
+                a.register_schema(tl::LAYER, tl::API_SCHEMA)?;
+                a.materialize()?;
+            }
+            return Ok(a);
+        }
         let db = connection(&root.join("catalog.sqlite3"), write)?;
         let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         ensure!(
@@ -178,20 +264,20 @@ impl Archive {
         );
         let mut a = Self {
             root: root.into(),
-            db,
-            config: Config::load(root)?,
+            store: crate::storage::Storage::Sqlite(db),
+            config,
             writable: write,
             schemas: Default::default(),
             blocks: Default::default(),
             _lock,
         };
-        if write {
-            crate::work::migrate(&a.db)?;
+        if write && !migration {
+            crate::work::migrate(a.store.sqlite()?)?;
             a.register_schema(tl::LAYER, tl::API_SCHEMA)?;
             a.materialize()?;
             a.recover_retired()?;
-        } else {
-            a.db.execute_batch("BEGIN;")?;
+        } else if !write {
+            a.store.sqlite()?.execute_batch("BEGIN;")?;
         }
         Ok(a)
     }
@@ -199,7 +285,17 @@ impl Archive {
         ensure!(self.writable, "read-only archive");
         Schema::parse(text)?;
         let hash = blake3::hash(text.as_bytes()).to_hex().to_string();
-        self.db.execute(
+        if self.store.clickhouse().is_some() {
+            if self.store.get::<SchemaRow>("hash", hash.clone())?.is_none() {
+                self.store.put(&SchemaRow {
+                    hash: hash.clone(),
+                    layer: i64::from(layer),
+                    definition: text.into(),
+                })?;
+            }
+            return Ok(hash);
+        }
+        self.store.sqlite()?.execute(
             "INSERT OR IGNORE INTO schemas VALUES(?1,?2,?3)",
             params![hash, layer, text],
         )?;
@@ -209,11 +305,11 @@ impl Archive {
         if let Some(schema) = self.schemas.borrow().get(hash) {
             return Ok(schema.clone());
         }
-        let text: String = self.db.query_row(
-            "SELECT definition FROM schemas WHERE hash=?1",
-            [hash],
-            |r| r.get(0),
-        )?;
+        let text = self
+            .store
+            .get::<SchemaRow>("hash", hash)?
+            .context("schema not found")?
+            .definition;
         ensure!(
             blake3::hash(text.as_bytes()).to_hex().as_str() == hash,
             "schema checksum mismatch"
@@ -233,7 +329,7 @@ impl Archive {
         let dt = DateTime::from_timestamp_micros(observed).context("invalid observation time")?;
         let name = self.config.epoch.key(dt);
         if let Some(id) = self
-            .db
+            .store.sqlite()?
             .query_row(
                 "SELECT id FROM epochs WHERE name=?1 AND sealed=0 AND accepting=1 ORDER BY id DESC LIMIT 1",
                 [&name],
@@ -244,13 +340,13 @@ impl Archive {
             let used = if let Some(used) = allocated.get(&id) {
                 *used
             } else {
-                let path: String = self.db.query_row("SELECT path FROM epochs WHERE id=?1",[id],|r|r.get(0))?;
+                let path: String = self.store.sqlite()?.query_row("SELECT path FROM epochs WHERE id=?1",[id],|r|r.get(0))?;
                 let epoch = connection(&self.root.join(path), false)?;
                 let pages: u64 = epoch.pragma_query_value(None,"page_count",|r|r.get(0))?;
                 let size: u64 = epoch.pragma_query_value(None,"page_size",|r|r.get(0))?;
                 let high: i64 = epoch.query_row("SELECT COALESCE(MAX(id),0) FROM observations",[],|r|r.get(0))?;
-                let pending: u64 = self.db.query_row("SELECT COALESCE(SUM(length(metadata)*2+length(key)+length(source)+8192),0) FROM observations WHERE epoch=?1 AND id>?2",params![id,high],|r|r.get(0))?;
-                let raw: u64 = self.db.query_row("SELECT COALESCE(SUM(length*2),0) FROM payloads WHERE epoch=?1 AND journal IS NOT NULL",[id],|r|r.get(0))?;
+                let pending: u64 = self.store.sqlite()?.query_row("SELECT COALESCE(SUM(length(metadata)*2+length(key)+length(source)+8192),0) FROM observations WHERE epoch=?1 AND id>?2",params![id,high],|r|r.get(0))?;
+                let raw: u64 = self.store.sqlite()?.query_row("SELECT COALESCE(SUM(length*2),0) FROM payloads WHERE epoch=?1 AND journal IS NOT NULL",[id],|r|r.get(0))?;
                 let used = pages * size + pending + raw;
                 allocated.insert(id, used);
                 used
@@ -258,9 +354,9 @@ impl Archive {
             if self.config.max_epoch_bytes == 0 || used+reserved.get(&id).copied().unwrap_or(0) < self.config.max_epoch_bytes {
                 return Ok(id);
             }
-            self.db.execute("UPDATE epochs SET accepting=0 WHERE id=?1",[id])?;
+            self.store.sqlite()?.execute("UPDATE epochs SET accepting=0 WHERE id=?1",[id])?;
         }
-        let generation: i64 = self.db.query_row(
+        let generation: i64 = self.store.sqlite()?.query_row(
             "SELECT COALESCE(MAX(generation),0)+1 FROM epochs WHERE name=?1",
             [&name],
             |r| r.get(0),
@@ -274,11 +370,11 @@ impl Archive {
         epoch.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         drop(epoch);
         sync_dir(&self.root.join("epochs"))?;
-        self.db.execute(
+        self.store.sqlite()?.execute(
             "INSERT INTO epochs(name,path,generation,part) VALUES(?1,?2,?3,(SELECT COALESCE(MAX(part),0)+1 FROM epochs WHERE name=?1))",
             params![name, path, generation],
         )?;
-        Ok(self.db.last_insert_rowid())
+        Ok(self.store.sqlite()?.last_insert_rowid())
     }
     pub fn ingest(
         &mut self,
@@ -287,6 +383,9 @@ impl Archive {
         checkpoint: Option<(&str, &Value)>,
     ) -> Result<Vec<i64>> {
         ensure!(self.writable, "read-only archive");
+        if self.store.clickhouse().is_some() {
+            return self.ch_ingest(schema_hash, items, checkpoint);
+        }
         let schema = self.schema(schema_hash)?;
         let mut prepared = Vec::new();
         let mut reserved = HashMap::new();
@@ -311,7 +410,7 @@ impl Archive {
                 tl::text(&value),
             ));
         }
-        let tx = self.db.transaction()?;
+        let tx = self.store.sqlite_mut()?.transaction()?;
         let mut ids = vec![];
         for (c, hash, epoch, text) in prepared {
             if let Some(replay) = &c.replay_key
@@ -375,7 +474,20 @@ impl Archive {
         self.materialize_with_hook(|_| Ok(()))
     }
     pub fn materialize_if_ready(&mut self) -> Result<()> {
-        let pending: u64 = self.db.query_row(
+        if let Some(db) = self.store.clickhouse() {
+            let pending = db.number(
+                format!(
+                    "SELECT toInt64(sum(length(journal))) AS value FROM {}",
+                    db.source("payloads", CATALOG_SCOPE)?
+                ),
+                vec![],
+            )?;
+            if pending >= self.config.block_bytes as i64 {
+                self.materialize()?;
+            }
+            return Ok(());
+        }
+        let pending: u64 = self.store.sqlite()?.query_row(
             "SELECT COALESCE(SUM(length(journal)),0) FROM payloads WHERE journal IS NOT NULL",
             [],
             |r| r.get(0),
@@ -390,9 +502,13 @@ impl Archive {
         mut hook: impl FnMut(CommitPoint) -> Result<()>,
     ) -> Result<()> {
         ensure!(self.writable, "read-only archive");
+        if self.store.clickhouse().is_some() {
+            return self.ch_materialize(&mut hook);
+        }
         loop {
             let pending: Option<i64> = self
-                .db
+                .store
+                .sqlite()?
                 .query_row(
                     "SELECT epoch FROM payloads WHERE journal IS NOT NULL LIMIT 1",
                     [],
@@ -400,13 +516,13 @@ impl Archive {
                 )
                 .optional()?;
             let Some(epoch_id) = pending else { break };
-            let path: String =
-                self.db
-                    .query_row("SELECT path FROM epochs WHERE id=?1", [epoch_id], |r| {
-                        r.get(0)
-                    })?;
+            let path: String = self.store.sqlite()?.query_row(
+                "SELECT path FROM epochs WHERE id=?1",
+                [epoch_id],
+                |r| r.get(0),
+            )?;
             let mut epoch = connection(&self.root.join(path), true)?;
-            let mut rows=self.db.prepare("SELECT hash,schema_hash,root_type,journal FROM payloads WHERE epoch=?1 AND journal IS NOT NULL ORDER BY hash")?;
+            let mut rows=self.store.sqlite()?.prepare("SELECT hash,schema_hash,root_type,journal FROM payloads WHERE epoch=?1 AND journal IS NOT NULL ORDER BY hash")?;
             let mut iter = rows.query([epoch_id])?;
             let mut payloads = vec![];
             let mut raw = vec![];
@@ -439,7 +555,7 @@ impl Archive {
             )?;
             let block = tx.last_insert_rowid();
             for (hash, schema, root, off, len) in &payloads {
-                let (layer, definition): (i32, String) = self.db.query_row(
+                let (layer, definition): (i32, String) = self.store.sqlite()?.query_row(
                     "SELECT layer,definition FROM schemas WHERE hash=?1",
                     [schema],
                     |r| Ok((r.get(0)?, r.get(1)?)),
@@ -455,7 +571,7 @@ impl Archive {
             }
             tx.commit()?;
             hook(CommitPoint::EpochCommitted)?;
-            let tx = self.db.transaction()?;
+            let tx = self.store.sqlite_mut()?.transaction()?;
             for (hash, _, _, _, _) in &payloads {
                 let (block, offset, length): (i64, i64, i64) = epoch.query_row(
                     "SELECT block,offset,length FROM payloads WHERE hash=?1",
@@ -482,7 +598,7 @@ impl Archive {
                     epoch.query_row("SELECT COALESCE(MAX(id),0) FROM observations", [], |r| {
                         r.get(0)
                     })?;
-                let mut statement=self.db.prepare("SELECT id,key,kind,observed,source,payload,metadata,partial,deleted,transformed,replay_key FROM observations WHERE epoch=?1 AND id>?2 ORDER BY id LIMIT 128")?;
+                let mut statement=self.store.sqlite()?.prepare("SELECT id,key,kind,observed,source,payload,metadata,partial,deleted,transformed,replay_key FROM observations WHERE epoch=?1 AND id>?2 ORDER BY id LIMIT 128")?;
                 let mut rows = statement.query(params![id, high])?;
                 let tx = epoch.transaction()?;
                 let mut copied = 0;
@@ -501,7 +617,7 @@ impl Archive {
                     break;
                 }
             }
-            self.db.execute(
+            self.store.sqlite()?.execute(
                 "UPDATE epochs SET sealed=1 WHERE id=?1 AND accepting=0",
                 [id],
             )?;
@@ -509,14 +625,29 @@ impl Archive {
         Ok(())
     }
     pub fn epochs(&self) -> Result<Vec<(i64, String, String, bool)>> {
+        if self.store.clickhouse().is_some() {
+            return Ok(self
+                .store
+                .select::<EpochRow>(&crate::storage::Select {
+                    order: Some("id"),
+                    ..Default::default()
+                })?
+                .into_iter()
+                .map(|e| (e.id, e.name, e.path, e.sealed != 0))
+                .collect());
+        }
         Ok(self
-            .db
+            .store
+            .sqlite()?
             .prepare("SELECT id,name,path,sealed FROM epochs ORDER BY id")?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<rusqlite::Result<_>>()?)
     }
     pub fn payload(&self, hash: &str) -> Result<Vec<u8>> {
-        let (schema,root,journal,path,block,offset,length):PayloadLocation=self.db.query_row("SELECT p.schema_hash,p.root_type,p.journal,e.path,p.block,p.offset,p.length FROM payloads p JOIN epochs e ON e.id=p.epoch WHERE p.hash=?1",[hash],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)))?;
+        if self.store.clickhouse().is_some() {
+            return self.ch_payload(hash);
+        }
+        let (schema,root,journal,path,block,offset,length):PayloadLocation=self.store.sqlite()?.query_row("SELECT p.schema_hash,p.root_type,p.journal,e.path,p.block,p.offset,p.length FROM payloads p JOIN epochs e ON e.id=p.epoch WHERE p.hash=?1",[hash],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)))?;
         let bytes = if let Some(bytes) = journal {
             bytes
         } else {
@@ -558,20 +689,23 @@ impl Archive {
         Ok(bytes)
     }
     pub fn record(&self, id: i64) -> Result<Record> {
-        let mut record=self.db.query_row("SELECT o.id,o.key,o.kind,o.observed,o.source,o.payload,p.root_type,p.schema_hash,o.partial,o.deleted,o.transformed,o.metadata FROM observations o JOIN payloads p ON o.payload=p.hash WHERE o.id=?1",[id],|r|Ok(Record{sequence:r.get(0)?,key:r.get(1)?,kind:r.get(2)?,observed_at:r.get(3)?,source:r.get(4)?,payload_hash:r.get(5)?,root_type:r.get(6)?,schema_hash:r.get(7)?,partial:r.get(8)?,deleted:r.get(9)?,transformed:r.get(10)?,metadata:Value::String(r.get(11)?),data:Value::Null,attachments:vec![],representations:vec![]}))?;
+        if self.store.clickhouse().is_some() {
+            return self.ch_record(id);
+        }
+        let mut record=self.store.sqlite()?.query_row("SELECT o.id,o.key,o.kind,o.observed,o.source,o.payload,p.root_type,p.schema_hash,o.partial,o.deleted,o.transformed,o.metadata FROM observations o JOIN payloads p ON o.payload=p.hash WHERE o.id=?1",[id],|r|Ok(Record{sequence:r.get(0)?,key:r.get(1)?,kind:r.get(2)?,observed_at:r.get(3)?,source:r.get(4)?,payload_hash:r.get(5)?,root_type:r.get(6)?,schema_hash:r.get(7)?,partial:r.get(8)?,deleted:r.get(9)?,transformed:r.get(10)?,metadata:Value::String(r.get(11)?),data:Value::Null,attachments:vec![],representations:vec![]}))?;
         record.metadata = serde_json::from_str(record.metadata.as_str().unwrap())?;
         record.data = self
             .schema(&record.schema_hash)?
             .decode(&record.root_type, &self.payload(&record.payload_hash)?)?;
         record.attachments = self.attachment_hashes(&record.data)?;
-        let extended: bool = self.db.query_row(
+        let extended: bool = self.store.sqlite()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='representations')",
             [],
             |r| r.get(0),
         )?;
         if extended {
             for hash in &record.attachments {
-                let mut statement=self.db.prepare("SELECT original,hash,recipe,bytes FROM representations WHERE original=?1 OR hash=?1")?;
+                let mut statement=self.store.sqlite()?.prepare("SELECT original,hash,recipe,bytes FROM representations WHERE original=?1 OR hash=?1")?;
                 for row in statement.query_map([hash], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -598,28 +732,36 @@ impl Archive {
         Ok(record)
     }
     pub fn checkpoint(&self, key: &str) -> Result<Option<Value>> {
-        self.db
-            .query_row("SELECT value FROM checkpoints WHERE key=?1", [key], |r| {
-                r.get::<_, String>(0)
-            })
-            .optional()?
-            .map(|s| Ok(serde_json::from_str(&s)?))
+        self.store
+            .get::<CheckpointRow>("key", key)?
+            .map(|r| Ok(serde_json::from_str(&r.value)?))
             .transpose()
     }
     pub fn set_checkpoint(&self, key: &str, value: &Value) -> Result<()> {
         ensure!(self.writable, "read-only archive");
-        self.db.execute("INSERT INTO checkpoints VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value.to_string()])?;
-        Ok(())
+        self.store.put(&CheckpointRow {
+            key: key.into(),
+            value: value.to_string(),
+        })
     }
     pub fn coverage(&self, name: &str, status: &str, details: &Value) -> Result<()> {
-        self.db.execute("INSERT INTO coverage VALUES(?1,?2,?3,?4) ON CONFLICT(name) DO UPDATE SET status=excluded.status,updated=excluded.updated,details=excluded.details",params![name,status,Utc::now().timestamp_micros(),details.to_string()])?;
-        Ok(())
+        self.store.put(&CoverageRow {
+            name: name.into(),
+            status: status.into(),
+            updated: Utc::now().timestamp_micros(),
+            details: details.to_string(),
+        })
     }
     pub fn storage_details(&self) -> Result<Value> {
+        if self.store.clickhouse().is_some() {
+            return self.ch_storage_details();
+        }
         let count = |table: &str| -> Result<i64> {
-            Ok(self
-                .db
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?)
+            Ok(self.store.sqlite()?.query_row(
+                &format!("SELECT COUNT(*) FROM {table}"),
+                [],
+                |r| r.get(0),
+            )?)
         };
         let pages = |db: &Connection| -> Result<BTreeMap<String, i64>> {
             Ok(db
@@ -627,7 +769,7 @@ impl Archive {
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<rusqlite::Result<_>>()?)
         };
-        let media_bytes: i64 = self.db.query_row("SELECT COALESCE(SUM(bytes),0) FROM (SELECT hash,MAX(offset) bytes FROM media WHERE status='complete' GROUP BY hash)", [], |r| r.get(0))?;
+        let media_bytes: i64 = self.store.sqlite()?.query_row("SELECT COALESCE(SUM(bytes),0) FROM (SELECT hash,MAX(offset) bytes FROM media WHERE status='complete' GROUP BY hash)", [], |r| r.get(0))?;
         let mut sizes = BTreeMap::new();
         for (_, name, path, _) in self.epochs()? {
             let epoch = connection(&self.root.join(&path), false)?;
@@ -644,16 +786,20 @@ impl Archive {
             sizes.insert(path.clone(),json!({"epoch":name,"bytes":fs::metadata(self.root.join(&path))?.len(),"compressed_payload_bytes":compressed,"uncompressed_payload_bytes":raw,"dictionary_bytes":dictionaries,"sqlite_pages_by_table":pages(&epoch)?}));
         }
         Ok(
-            json!({"format_version":FORMAT_VERSION,"observations":count("observations")?,"objects":count("heads")?,"payloads":count("payloads")?,"media":count("media")?,"media_bytes":media_bytes,"catalog_pages_by_table":pages(&self.db)?,"epochs":sizes,"catalog_bytes":fs::metadata(self.root.join("catalog.sqlite3"))?.len(),"pending_payloads":self.db.query_row("SELECT COUNT(*) FROM payloads WHERE journal IS NOT NULL",[],|r|r.get::<_,i64>(0))?}),
+            json!({"format_version":FORMAT_VERSION,"observations":count("observations")?,"objects":count("heads")?,"payloads":count("payloads")?,"media":count("media")?,"media_bytes":media_bytes,"catalog_pages_by_table":pages(self.store.sqlite()?)?,"epochs":sizes,"catalog_bytes":fs::metadata(self.root.join("catalog.sqlite3"))?.len(),"pending_payloads":self.store.sqlite()?.query_row("SELECT COUNT(*) FROM payloads WHERE journal IS NOT NULL",[],|r|r.get::<_,i64>(0))?}),
         )
     }
     pub fn list_table(&self, table: &str) -> Result<Value> {
+        if self.store.clickhouse().is_some() {
+            return self.ch_list_table(table);
+        }
         ensure!(
             ["jobs", "coverage", "media", "maintenance"].contains(&table),
             "unsupported table"
         );
         let mut st = self
-            .db
+            .store
+            .sqlite()?
             .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))?;
         let names = st
             .column_names()
@@ -683,13 +829,18 @@ impl Archive {
     }
     pub fn verify(&self) -> Result<Value> {
         self.blocks.borrow_mut().clear();
-        let integrity: String = self
-            .db
-            .query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        if self.store.clickhouse().is_some() {
+            return self.ch_verify();
+        }
+        let integrity: String =
+            self.store
+                .sqlite()?
+                .query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
         ensure!(integrity == "ok", "catalog: {integrity}");
         let mut checked = 0;
         let mut st = self
-            .db
+            .store
+            .sqlite()?
             .prepare("SELECT hash,schema_hash,root_type FROM payloads ORDER BY hash")?;
         let mut rows = st.query([])?;
         while let Some(r) = rows.next()? {
@@ -703,14 +854,14 @@ impl Archive {
             let integrity: String = db.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
             ensure!(integrity == "ok", "epoch: {integrity}");
         }
-        let violations: i64 =
-            self.db
-                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
-                    r.get(0)
-                })?;
+        let violations: i64 = self.store.sqlite()?.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_check",
+            [],
+            |r| r.get(0),
+        )?;
         ensure!(violations == 0, "dangling references");
         let mut statement = self
-            .db
+            .store.sqlite()?
             .prepare("SELECT DISTINCT hash FROM media WHERE status='complete' UNION SELECT hash FROM representations")?;
         for row in statement.query_map([], |r| r.get::<_, String>(0))? {
             let hash = row?;
@@ -723,17 +874,22 @@ impl Archive {
         Ok(json!({"verified_payloads":checked,"integrity":"ok"}))
     }
     pub fn reindex(&mut self) -> Result<()> {
-        self.db.execute_batch("BEGIN IMMEDIATE;")?;
+        if self.store.clickhouse().is_some() {
+            return self.ch_reindex();
+        }
+        self.store.sqlite()?.execute_batch("BEGIN IMMEDIATE;")?;
         let result = self.reindex_inner();
         if result.is_ok() {
-            self.db.execute_batch("COMMIT;")?;
+            self.store.sqlite()?.execute_batch("COMMIT;")?;
         } else {
-            self.db.execute_batch("ROLLBACK;")?;
+            self.store.sqlite()?.execute_batch("ROLLBACK;")?;
         }
         result
     }
     fn reindex_inner(&mut self) -> Result<()> {
-        self.db.execute("DELETE FROM history_search", [])?;
+        self.store
+            .sqlite()?
+            .execute("DELETE FROM history_search", [])?;
         if self.config.index_history {
             let mut after = 0;
             loop {
@@ -744,17 +900,17 @@ impl Archive {
                 for id in ids {
                     after = id;
                     let r = self.record(id)?;
-                    self.db.execute(
+                    self.store.sqlite()?.execute(
                         "INSERT INTO history_search(rowid,text) VALUES(?1,?2)",
                         params![id, tl::text(&r.data)],
                     )?;
                 }
             }
         }
-        self.db.execute("DELETE FROM search", [])?;
+        self.store.sqlite()?.execute("DELETE FROM search", [])?;
         let mut after = 0;
         loop {
-            let ids:Vec<i64>=self.db.prepare("SELECT observation FROM heads WHERE observation>?1 ORDER BY observation LIMIT 128")?.query_map([after],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            let ids:Vec<i64>=self.store.sqlite()?.prepare("SELECT observation FROM heads WHERE observation>?1 ORDER BY observation LIMIT 128")?.query_map([after],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
             if ids.is_empty() {
                 break;
             }
@@ -762,7 +918,7 @@ impl Archive {
                 after = id;
                 let r = self.record(id)?;
                 if !r.deleted {
-                    self.db.execute(
+                    self.store.sqlite()?.execute(
                         "INSERT INTO search(rowid,text) VALUES(?1,?2)",
                         params![id, tl::text(&r.data)],
                     )?;
@@ -840,6 +996,9 @@ impl Archive {
         mut hook: impl FnMut(CommitPoint) -> Result<()>,
     ) -> Result<Value> {
         ensure!(self.writable, "maintenance needs writer access");
+        if self.store.clickhouse().is_some() {
+            return self.ch_maintain(options, &mut hook);
+        }
         ensure!(
             !options.retention.lossy() || options.retention.before.is_some(),
             "lossy retention requires an observation cutoff"
@@ -851,7 +1010,10 @@ impl Archive {
                 .rsplit_once('.')
                 .context("retention field must be constructor.field")?;
             let mut found = false;
-            let mut st = self.db.prepare("SELECT definition FROM schemas")?;
+            let mut st = self
+                .store
+                .sqlite()?
+                .prepare("SELECT definition FROM schemas")?;
             for definition in st.query_map([], |r| r.get::<_, String>(0))? {
                 let s = Schema::parse(&definition?)?;
                 let mut value = json!({"_":constructor,name:Value::Null});
@@ -902,7 +1064,7 @@ impl Archive {
             .root
             .join("staging")
             .join(format!("catalog-{token}.sqlite3"));
-        self.db.execute(
+        self.store.sqlite()?.execute(
             "VACUUM INTO ?1",
             [staged_path.to_str().context("dataset path must be UTF-8")?],
         )?;
@@ -1178,7 +1340,7 @@ impl Archive {
         // Rebuild search against staged payload locations before publishing.
         let staged_archive = Archive {
             root: self.root.clone(),
-            db: stage,
+            store: Storage::Sqlite(stage),
             config: self.config.clone(),
             writable: true,
             schemas: Default::default(),
@@ -1189,25 +1351,28 @@ impl Archive {
         staged_archive.split_oversized()?;
         staged_archive.reindex()?;
         staged_archive.verify()?;
-        staged_archive.db.execute_batch(
+        staged_archive.store.sqlite()?.execute_batch(
             "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE; VACUUM;",
         )?;
         drop(staged_archive);
         File::open(&staged_path)?.sync_all()?;
         hook(CommitPoint::GenerationReady)?;
         sync_dir(&self.root.join("epochs"))?;
-        self.db
+        self.store
+            .sqlite()?
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
-        let old = std::mem::replace(&mut self.db, Connection::open_in_memory()?);
+        let old = std::mem::replace(self.store.sqlite_mut()?, Connection::open_in_memory()?);
         drop(old);
         fs::rename(&staged_path, self.root.join("catalog.sqlite3"))?;
         sync_dir(&self.root)?;
-        self.db = connection(&self.root.join("catalog.sqlite3"), true)?;
+        self.store =
+            crate::storage::Storage::Sqlite(connection(&self.root.join("catalog.sqlite3"), true)?);
         self.blocks.borrow_mut().clear();
         hook(CommitPoint::GenerationPublished)?;
         // Readers were drained before replacement, so no process can still reference retired files.
         let retired: Vec<String> = self
-            .db
+            .store
+            .sqlite()?
             .prepare("SELECT path FROM retired")?
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
@@ -1219,19 +1384,31 @@ impl Archive {
                 }
             }
         }
-        self.db.execute("DELETE FROM retired", [])?;
+        self.store.sqlite()?.execute("DELETE FROM retired", [])?;
         self.gc_attachments()?;
         drop(readers);
         Ok(report)
     }
     pub fn observation_ids(&self, after: i64, limit: usize) -> Result<Vec<i64>> {
+        if self.store.clickhouse().is_some() {
+            return Ok(self
+                .store
+                .select::<ObservationRow>(&crate::storage::Select::after("id", after, limit))?
+                .into_iter()
+                .map(|o| o.id)
+                .collect());
+        }
         Ok(self
-            .db
+            .store
+            .sqlite()?
             .prepare("SELECT id FROM observations WHERE id>?1 ORDER BY id LIMIT ?2")?
             .query_map(params![after, limit], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?)
     }
     pub fn seal_due(&mut self) -> Result<()> {
+        if self.store.clickhouse().is_some() {
+            return self.ch_seal_due();
+        }
         let current = self.config.epoch.key(Utc::now());
         if self
             .epochs()?
@@ -1249,7 +1426,8 @@ impl Archive {
     }
     fn recover_retired(&self) -> Result<()> {
         let paths: Vec<String> = self
-            .db
+            .store
+            .sqlite()?
             .prepare("SELECT path FROM retired")?
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
@@ -1282,7 +1460,7 @@ impl Archive {
                 }
             }
         }
-        self.db.execute("DELETE FROM retired", [])?;
+        self.store.sqlite()?.execute("DELETE FROM retired", [])?;
         for (catalog, token) in staged {
             for entry in fs::read_dir(self.root.join("epochs"))? {
                 let entry = entry?;
@@ -1291,7 +1469,7 @@ impl Archive {
                     continue;
                 }
                 let path = format!("epochs/{name}");
-                let live: bool = self.db.query_row(
+                let live: bool = self.store.sqlite()?.query_row(
                     "SELECT EXISTS(SELECT 1 FROM epochs WHERE path=?1)",
                     [&path],
                     |r| r.get(0),
@@ -1319,7 +1497,7 @@ impl Archive {
         if r.observed_at >= cutoff || r.deleted {
             return Ok(false);
         }
-        let latest: bool = self.db.query_row(
+        let latest: bool = self.store.sqlite()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM heads WHERE observation=?1)",
             [r.sequence],
             |r| r.get(0),
@@ -1328,7 +1506,7 @@ impl Archive {
             return Ok(!latest);
         }
         if policy.coalesce_observations && !latest {
-            let previous:Option<String>=self.db.query_row("SELECT payload FROM observations WHERE key=?1 AND id<?2 ORDER BY id DESC LIMIT 1",params![r.key,r.sequence],|r|r.get(0)).optional()?;
+            let previous:Option<String>=self.store.sqlite()?.query_row("SELECT payload FROM observations WHERE key=?1 AND id<?2 ORDER BY id DESC LIMIT 1",params![r.key,r.sequence],|r|r.get(0)).optional()?;
             if previous.as_deref() == Some(&r.payload_hash) {
                 return Ok(true);
             }
@@ -1348,15 +1526,32 @@ impl Archive {
         if latest {
             return Ok(false);
         }
-        let first: i64 = self.db.query_row(
+        let first: i64 = self.store.sqlite()?.query_row(
             "SELECT MIN(id) FROM observations WHERE key=?1",
             [&r.key],
             |r| r.get(0),
         )?;
         Ok(first != r.sequence)
     }
-    fn gc_attachments(&self) -> Result<()> {
-        self.db.execute("DELETE FROM representations WHERE original NOT IN(SELECT hash FROM media WHERE hash IS NOT NULL) AND hash NOT IN(SELECT hash FROM media WHERE hash IS NOT NULL)",[])?;
+    pub(crate) fn gc_attachments(&self) -> Result<()> {
+        if self.store.clickhouse().is_some() {
+            let hashes = self
+                .store
+                .all::<MediaRow>()?
+                .into_iter()
+                .filter_map(|r| r.hash)
+                .collect::<std::collections::BTreeSet<_>>();
+            for row in self
+                .store
+                .all::<RepresentationRow>()?
+                .into_iter()
+                .filter(|r| !hashes.contains(&r.original) && !hashes.contains(&r.hash))
+            {
+                self.store.delete(&row)?;
+            }
+        } else {
+            self.store.sqlite()?.execute("DELETE FROM representations WHERE original NOT IN(SELECT hash FROM media WHERE hash IS NOT NULL) AND hash NOT IN(SELECT hash FROM media WHERE hash IS NOT NULL)",[])?;
+        }
         for dir in fs::read_dir(self.root.join("attachments"))? {
             let dir = dir?;
             if !dir.file_type()?.is_dir() {
@@ -1368,11 +1563,14 @@ impl Archive {
                 if hash.len() != 64 {
                     continue;
                 }
-                let used: bool = self.db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM media WHERE hash=?1 UNION SELECT 1 FROM representations WHERE hash=?1)",
-                    [&hash],
-                    |r| r.get(0),
-                )?;
+                let used = !self
+                    .store
+                    .select::<MediaRow>(&crate::storage::Select::eq("hash", hash.clone()))?
+                    .is_empty()
+                    || !self
+                        .store
+                        .select::<RepresentationRow>(&crate::storage::Select::eq("hash", hash))?
+                        .is_empty();
                 if !used {
                     fs::remove_file(file.path())?;
                 }
@@ -1459,8 +1657,8 @@ impl Archive {
                 let path = format!("epochs/{name}.p{part:04}.{}.sqlite3", uuid::Uuid::new_v4());
                 let out = connection(&self.root.join(&path), true)?;
                 out.execute_batch(EPOCH)?;
-                self.db.execute("INSERT INTO epochs(name,path,sealed,generation,accepting,part) VALUES(?1,?2,?3,1,0,?4)",params![name,path,sealed,part])?;
-                Ok((out, self.db.last_insert_rowid(), path))
+                self.store.sqlite()?.execute("INSERT INTO epochs(name,path,sealed,generation,accepting,part) VALUES(?1,?2,?3,1,0,?4)",params![name,path,sealed,part])?;
+                Ok((out, self.store.sqlite()?.last_insert_rowid(), path))
             };
             let (mut out, mut id, mut path) = create()?;
             let mut wrote = false;
@@ -1520,7 +1718,7 @@ impl Archive {
                         "INSERT INTO payloads VALUES(?1,?2,?3,?4,?5,?6)",
                         rusqlite::params_from_iter(values),
                     )?;
-                    self.db.execute(
+                    self.store.sqlite()?.execute(
                         "UPDATE payloads SET epoch=?2 WHERE hash=?1 AND epoch=?3",
                         params![hash, id, old_id],
                     )?;
@@ -1543,7 +1741,7 @@ impl Archive {
                     "INSERT INTO observations VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                     rusqlite::params_from_iter(values),
                 )?;
-                self.db.execute(
+                self.store.sqlite()?.execute(
                     "UPDATE observations SET epoch=?2 WHERE id=?1 AND epoch=?3",
                     params![row.get::<_, i64>(0)?, id, old_id],
                 )?;
@@ -1551,9 +1749,11 @@ impl Archive {
             }
             out.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
             File::open(self.root.join(path))?.sync_all()?;
-            self.db
+            self.store
+                .sqlite()?
                 .execute("DELETE FROM epochs WHERE id=?1", [old_id])?;
-            self.db
+            self.store
+                .sqlite()?
                 .execute("INSERT OR IGNORE INTO retired VALUES(?1)", [old_path])?;
         }
         sync_dir(&self.root.join("epochs"))?;

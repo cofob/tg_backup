@@ -1,5 +1,9 @@
 //! Bounded read-only archive exploration shared by the HTTP and local adapters.
-use crate::archive::Archive;
+use crate::{
+    archive::Archive,
+    config::Backend,
+    storage::{CATALOG, Select, rows::*},
+};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rusqlite::{Connection, OpenFlags, params, types::ValueRef};
@@ -41,6 +45,10 @@ struct Cursor {
     snapshot: i64,
     offset: i64,
     fingerprint: String,
+    #[serde(default)]
+    backend: Backend,
+    #[serde(default)]
+    commit: Option<i64>,
 }
 fn quoted(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
@@ -99,9 +107,11 @@ impl Archive {
                 .strip_prefix("epoch:")
                 .context("unknown database")?
                 .parse()?;
-            let path: String =
-                self.db
-                    .query_row("SELECT path FROM epochs WHERE id=?1", [id], |r| r.get(0))?;
+            let path: String = self.store.sqlite()?.query_row(
+                "SELECT path FROM epochs WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )?;
             let candidate = self.root.join(path).canonicalize()?;
             ensure!(
                 candidate.starts_with(self.root.join("epochs").canonicalize()?),
@@ -134,7 +144,12 @@ impl Archive {
         Ok(columns)
     }
     pub fn explore(&self, request: &BrowseRequest) -> Result<BrowsePage> {
-        let _deadline = Deadline::new(&self.db)?;
+        let revision = crate::storage::REVISION;
+        let _deadline = if self.store.clickhouse().is_none() {
+            Some(Deadline::new(self.store.sqlite()?)?)
+        } else {
+            None
+        };
         ensure!((1..=1000).contains(&request.limit), "limit must be 1–1000");
         ensure!(request.search.len() <= 4096, "search too long");
         let mut normalized = request.clone();
@@ -142,11 +157,7 @@ impl Archive {
         let fingerprint = blake3::hash(&serde_json::to_vec(&normalized)?)
             .to_hex()
             .to_string();
-        let dataset: String = self.db.query_row(
-            "SELECT value FROM settings WHERE key='dataset_id'",
-            [],
-            |r| r.get(0),
-        )?;
+        let dataset = self.dataset_id()?;
         let generation = self.explorer_generation()?;
         let mut cursor = if let Some(s) = &request.cursor {
             ensure!(s.len() < 8192, "cursor too large");
@@ -155,41 +166,39 @@ impl Archive {
             Cursor {
                 dataset: dataset.clone(),
                 generation: generation.clone(),
-                snapshot: self.db.query_row(
-                    "SELECT COALESCE(MAX(id),0) FROM observations",
-                    [],
-                    |r| r.get(0),
-                )?,
+                snapshot: self.observation_high_water()?,
+                backend: self.config.backend,
+                commit: self.store.clickhouse().map(|db| db.snapshot()),
                 offset: 0,
                 fingerprint: fingerprint.clone(),
             }
         };
         ensure!(
             cursor.dataset == dataset
+                && cursor.backend == self.config.backend
                 && cursor.generation == generation
                 && cursor.fingerprint == fingerprint
                 && cursor.offset >= 0,
             "cursor invalidated or does not match this view; refresh"
         );
+        let _snapshot = self
+            .store
+            .clickhouse()
+            .map(|db| db.freeze(cursor.commit.context("ClickHouse cursor has no commit")?))
+            .transpose()?;
         let mut page = BrowsePage::default();
         let mut more = false;
         match &request.target {
             Browse::Attachment { hash } => {
                 let path = crate::media::attachment_path(&self.root, hash)?;
-                let mut st = self.db.prepare(
-                    "SELECT id,size,status,error FROM media WHERE hash=?1 ORDER BY id LIMIT 100",
-                )?;
-                let media=st.query_map([hash],|r|Ok(json!({"id":r.get::<_,String>(0)?,"size":r.get::<_,Option<u64>>(1)?,"status":r.get::<_,String>(2)?,"error":r.get::<_,Option<String>>(3)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
-                let mut representations = vec![];
-                let extended: bool = self.db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='representations')",
-                    [],
-                    |r| r.get(0),
-                )?;
-                if extended {
-                    let mut st=self.db.prepare("SELECT original,hash,recipe,bytes FROM representations WHERE original=?1 OR hash=?1 LIMIT 100")?;
-                    representations=st.query_map([hash],|r|Ok(json!({"original":r.get::<_,String>(0)?,"hash":r.get::<_,String>(1)?,"recipe":r.get::<_,String>(2)?,"bytes":r.get::<_,u64>(3)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
-                }
+                let media = self
+                    .store
+                    .select::<MediaRow>(&Select::eq("hash", hash.clone()))?
+                    .into_iter()
+                    .take(100)
+                    .map(|r| json!({"id":r.id,"size":r.size,"status":r.status,"error":r.error}))
+                    .collect::<Vec<_>>();
+                let representations = self.representations_for(hash)?.into_iter().take(100).map(|r| json!({"original":r.original,"hash":r.hash,"recipe":r.recipe,"bytes":r.bytes})).collect::<Vec<_>>();
                 ensure!(
                     !media.is_empty() || !representations.is_empty(),
                     "attachment not retained in archive metadata"
@@ -234,133 +243,153 @@ impl Archive {
                 paginate_entries(&mut page, &mut cursor, request, &mut more);
             }
             Browse::Tables { database } => {
-                let db = self.explorer_database(database)?;
-                let mut st = db.prepare(
-                    "SELECT name,sql FROM sqlite_master WHERE type='table' ORDER BY name",
-                )?;
-                for row in st.query_map([], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
-                })? {
-                    let (name, sql) = row?;
-                    if TABLES.contains(&name.as_str()) {
-                        let columns = Self::explorer_columns(&db, &name)?;
-                        let mut e = Entry::new(&name, &name, json!({"sql":sql,"columns":columns}));
-                        e.open = Some(Browse::Rows {
-                            database: database.clone(),
-                            table: name,
-                            row: None,
-                        });
-                        page.entries.push(e);
+                if self.store.clickhouse().is_some() {
+                    self.ch_tables(database, &mut page)?;
+                    paginate_entries(&mut page, &mut cursor, request, &mut more);
+                } else {
+                    let db = self.explorer_database(database)?;
+                    let mut st = db.prepare(
+                        "SELECT name,sql FROM sqlite_master WHERE type='table' ORDER BY name",
+                    )?;
+                    for row in st.query_map([], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                    })? {
+                        let (name, sql) = row?;
+                        if TABLES.contains(&name.as_str()) {
+                            let columns = Self::explorer_columns(&db, &name)?;
+                            let mut e =
+                                Entry::new(&name, &name, json!({"sql":sql,"columns":columns}));
+                            e.open = Some(Browse::Rows {
+                                database: database.clone(),
+                                table: name,
+                                row: None,
+                            });
+                            page.entries.push(e);
+                        }
                     }
+                    paginate_entries(&mut page, &mut cursor, request, &mut more);
                 }
-                paginate_entries(&mut page, &mut cursor, request, &mut more);
             }
             Browse::Rows {
                 database,
                 table,
                 row,
             } => {
-                let db = self.explorer_database(database)?;
-                page.columns = Self::explorer_columns(&db, table)?;
-                page.live = true;
-                // Large values are never fetched into the row response. typeof/length preserve SQLite storage classes.
-                let expressions = page.columns.iter().map(|c| { let q = quoted(&c.name); format!("typeof({q}),length(CAST({q} AS BLOB)),CASE WHEN typeof({q})='blob' OR (typeof({q})='text' AND length(CAST({q} AS BLOB))>4096) THEN NULL ELSE {q} END") }).collect::<Vec<_>>().join(",");
-                let filter = if table == "checkpoints" {
-                    " AND key NOT LIKE 'takeout:%'"
+                if self.store.clickhouse().is_some() {
+                    more = self.ch_rows(database, table, *row, request, &mut cursor, &mut page)?;
                 } else {
-                    ""
-                };
-                let sql = format!(
-                    "SELECT rowid,{expressions} FROM {} WHERE rowid>?1 AND (?2 IS NULL OR rowid=?2){filter} ORDER BY rowid LIMIT ?3",
-                    quoted(table)
-                );
-                let mut st = db.prepare(&sql)?;
-                let mut rows = st.query(params![cursor.offset, row, 10001])?;
-                let mut bytes = 0usize;
-                let mut scanned = 0;
-                while let Some(r) = rows.next()? {
-                    if page.entries.len() == request.limit
-                        || bytes > 1024 * 1024
-                        || scanned == 10000
-                    {
-                        more = true;
-                        break;
-                    }
-                    scanned += 1;
-                    let id: i64 = r.get(0)?;
-                    cursor.offset = id;
-                    let mut cells = serde_json::Map::new();
-                    let mut binaries = vec![];
-                    for (i, c) in page.columns.iter().enumerate() {
-                        let ty: String = r.get(1 + i * 3)?;
-                        let size: Option<u64> = r.get(2 + i * 3)?;
-                        let reference = BinaryRef::Cell {
-                            database: database.clone(),
-                            table: table.clone(),
-                            row: id,
-                            column: c.name.clone(),
-                            generation: generation.clone(),
-                        };
-                        let cell = match (ty.as_str(), r.get_ref(3 + i * 3)?) {
-                            ("blob", _) => {
-                                binaries.push(reference.clone());
-                                Cell::Blob {
-                                    bytes: size.unwrap_or(0),
-                                    reference,
-                                }
-                            }
-                            ("text", ValueRef::Null) => {
-                                binaries.push(reference.clone());
-                                Cell::LargeText {
-                                    bytes: size.unwrap_or(0),
-                                    reference,
-                                }
-                            }
-                            (_, ValueRef::Null) => Cell::Null,
-                            (_, ValueRef::Integer(n)) => Cell::Integer(n.to_string()),
-                            (_, ValueRef::Real(n)) => Cell::Real(n.to_string()),
-                            (_, ValueRef::Text(s)) => {
-                                binaries.push(reference.clone());
-                                match std::str::from_utf8(s) {
-                                    Ok(text) => Cell::Text(text.into()),
-                                    Err(_) => Cell::LargeText {
-                                        bytes: s.len() as u64,
+                    let db = self.explorer_database(database)?;
+                    page.columns = Self::explorer_columns(&db, table)?;
+                    page.live = true;
+                    // Large values are never fetched into the row response. typeof/length preserve SQLite storage classes.
+                    let expressions = page.columns.iter().map(|c| { let q = quoted(&c.name); format!("typeof({q}),length(CAST({q} AS BLOB)),CASE WHEN typeof({q})='blob' OR (typeof({q})='text' AND length(CAST({q} AS BLOB))>4096) THEN NULL ELSE {q} END") }).collect::<Vec<_>>().join(",");
+                    let filter = if table == "checkpoints" {
+                        " AND key NOT LIKE 'takeout:%'"
+                    } else {
+                        ""
+                    };
+                    let sql = format!(
+                        "SELECT rowid,{expressions} FROM {} WHERE rowid>?1 AND (?2 IS NULL OR rowid=?2){filter} ORDER BY rowid LIMIT ?3",
+                        quoted(table)
+                    );
+                    let mut st = db.prepare(&sql)?;
+                    let mut rows = st.query(params![cursor.offset, row, 10001])?;
+                    let mut bytes = 0usize;
+                    let mut scanned = 0;
+                    while let Some(r) = rows.next()? {
+                        if page.entries.len() == request.limit
+                            || bytes > 1024 * 1024
+                            || scanned == 10000
+                        {
+                            more = true;
+                            break;
+                        }
+                        scanned += 1;
+                        let id: i64 = r.get(0)?;
+                        cursor.offset = id;
+                        let mut cells = serde_json::Map::new();
+                        let mut binaries = vec![];
+                        for (i, c) in page.columns.iter().enumerate() {
+                            let ty: String = r.get(1 + i * 3)?;
+                            let size: Option<u64> = r.get(2 + i * 3)?;
+                            let reference = BinaryRef::Cell {
+                                database: database.clone(),
+                                table: table.clone(),
+                                row: id,
+                                column: c.name.clone(),
+                                generation: generation.clone(),
+                            };
+                            let cell = match (ty.as_str(), r.get_ref(3 + i * 3)?) {
+                                ("blob", _) => {
+                                    binaries.push(reference.clone());
+                                    Cell::Blob {
+                                        bytes: size.unwrap_or(0),
                                         reference,
-                                    },
+                                    }
                                 }
-                            }
-                            _ => bail!("unsupported SQLite cell"),
-                        };
-                        cells.insert(c.name.clone(), serde_json::to_value(cell)?);
+                                ("text", ValueRef::Null) => {
+                                    binaries.push(reference.clone());
+                                    Cell::LargeText {
+                                        bytes: size.unwrap_or(0),
+                                        reference,
+                                    }
+                                }
+                                (_, ValueRef::Null) => Cell::Null,
+                                (_, ValueRef::Integer(n)) => Cell::Integer(n.to_string()),
+                                (_, ValueRef::Real(n)) => Cell::Real(n.to_string()),
+                                (_, ValueRef::Text(s)) => {
+                                    binaries.push(reference.clone());
+                                    match std::str::from_utf8(s) {
+                                        Ok(text) => Cell::Text(text.into()),
+                                        Err(_) => Cell::LargeText {
+                                            bytes: s.len() as u64,
+                                            reference,
+                                        },
+                                    }
+                                }
+                                _ => bail!("unsupported SQLite cell"),
+                            };
+                            cells.insert(c.name.clone(), serde_json::to_value(cell)?);
+                        }
+                        let detail = Value::Object(cells);
+                        if !request.search.is_empty()
+                            && !detail
+                                .to_string()
+                                .to_lowercase()
+                                .contains(&request.search.to_lowercase())
+                        {
+                            continue;
+                        }
+                        bytes += serde_json::to_vec(&detail)?.len();
+                        let preview = page
+                            .columns
+                            .iter()
+                            .take(3)
+                            .filter_map(|c| detail[&c.name]["value"].as_str())
+                            .collect::<Vec<_>>()
+                            .join(" · ");
+                        let mut e = Entry::new(id.to_string(), format!("#{id} {preview}"), detail);
+                        e.binaries = binaries;
+                        if table == "observations" {
+                            e.open = Some(Browse::Location { sequence: id });
+                        }
+                        page.entries.push(e);
+                        cursor.offset = id;
                     }
-                    let detail = Value::Object(cells);
-                    if !request.search.is_empty()
-                        && !detail
-                            .to_string()
-                            .to_lowercase()
-                            .contains(&request.search.to_lowercase())
-                    {
-                        continue;
-                    }
-                    bytes += serde_json::to_vec(&detail)?.len();
-                    let preview = page
-                        .columns
-                        .iter()
-                        .take(3)
-                        .filter_map(|c| detail[&c.name]["value"].as_str())
-                        .collect::<Vec<_>>()
-                        .join(" · ");
-                    let mut e = Entry::new(id.to_string(), format!("#{id} {preview}"), detail);
-                    e.binaries = binaries;
-                    if table == "observations" {
-                        e.open = Some(Browse::Location { sequence: id });
-                    }
-                    page.entries.push(e);
-                    cursor.offset = id;
                 }
             }
             Browse::Location { sequence } => {
-                let (hash, epoch, block, offset, length, pending, schema): (String,i64,Option<i64>,Option<i64>,i64,bool,String) = self.db.query_row("SELECT p.hash,p.epoch,p.block,p.offset,p.length,p.journal IS NOT NULL,p.schema_hash FROM observations o JOIN payloads p ON p.hash=o.payload WHERE o.id=?1", [sequence], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)))?;
+                let observation = self
+                    .store
+                    .get::<ObservationRow>("id", *sequence)?
+                    .context("observation not found")?;
+                let p = self
+                    .store
+                    .get::<PayloadRow>("hash", observation.payload)?
+                    .context("payload not found")?;
+                let pending = p.has_journal();
+                let (hash, epoch, block, offset, length, schema) =
+                    (p.hash, p.epoch, p.block, p.offset, p.length, p.schema_hash);
                 let mut e = Entry::new(
                     "payload",
                     "Original TL bytes",
@@ -383,17 +412,9 @@ impl Archive {
                     *sequence,
                     "Catalog observation",
                 );
-                let payload_row = self.db.query_row(
-                    "SELECT rowid FROM payloads WHERE hash=?1",
-                    [&hash],
-                    |r| r.get(0),
-                )?;
+                let payload_row = self.storage_row_id("payloads", "hash", &hash)?;
                 add_row("catalog".into(), "payloads", payload_row, "Catalog payload");
-                let schema_row = self.db.query_row(
-                    "SELECT rowid FROM schemas WHERE hash=?1",
-                    [&schema],
-                    |r| r.get(0),
-                )?;
+                let schema_row = self.storage_row_id("schemas", "hash", &schema)?;
                 add_row(
                     "catalog".into(),
                     "schemas",
@@ -403,11 +424,22 @@ impl Archive {
                 if let Some(block) = block {
                     let database = format!("epoch:{epoch}");
                     add_row(database.clone(), "blocks", block, "Compressed block");
-                    let db = self.explorer_database(&database)?;
-                    let dictionary: Option<i64> =
-                        db.query_row("SELECT dictionary FROM blocks WHERE id=?1", [block], |r| {
-                            r.get(0)
-                        })?;
+                    let dictionary = if let Some(db) = self.store.clickhouse() {
+                        let epoch = self
+                            .store
+                            .get::<EpochRow>("id", epoch)?
+                            .context("epoch missing")?;
+                        db.select::<BlockRow>(&epoch.path, &Select::eq("id", block))?
+                            .first()
+                            .context("block missing")?
+                            .dictionary
+                    } else {
+                        self.explorer_database(&database)?.query_row(
+                            "SELECT dictionary FROM blocks WHERE id=?1",
+                            [block],
+                            |r| r.get::<_, Option<i64>>(0),
+                        )?
+                    };
                     if let Some(id) = dictionary {
                         add_row(database, "dictionaries", id, "Compression dictionary");
                     }
@@ -457,12 +489,22 @@ impl Archive {
                 // Snapshot ranking matches the archive current-object query, including full-over-partial precedence.
                 let sql = "WITH ranked AS (SELECT id,key,ROW_NUMBER() OVER(PARTITION BY key ORDER BY partial ASC,COALESCE(json_extract(metadata,'$.revision'),observed) DESC,id DESC) AS rank FROM observations WHERE id<=?1 AND kind='message' AND key>=?2 AND key<(?2 || char(127))) SELECT id,CAST(substr(key,length(?2)+1) AS INTEGER) AS message_id FROM ranked WHERE rank=1 AND (?3=0 OR CAST(substr(key,length(?2)+1) AS INTEGER)<?3) ORDER BY message_id DESC LIMIT 10001";
                 let prefix = format!("{peer}/message:");
-                let mut st = self.db.prepare(sql)?;
-                let candidates = st
-                    .query_map(params![cursor.snapshot, prefix, cursor.offset], |r| {
-                        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let candidates = if let Some(db) = self.store.clickhouse() {
+                    #[derive(Deserialize, clickhouse::Row)]
+                    struct Candidate {
+                        id: i64,
+                        value: i64,
+                    }
+                    db.query::<Candidate>(format!("SELECT id,toInt64OrZero(substring(key,length(?)+1)) AS value FROM {} WHERE key LIKE ? AND id<=? QUALIFY row_number() OVER (PARTITION BY key ORDER BY partial,{revision} DESC,id DESC)=1 ORDER BY value DESC LIMIT 10001",db.source("observations",CATALOG)?),vec![json!(prefix),json!(format!("{prefix}%")),json!(cursor.snapshot)])?.into_iter().map(|r| (r.id,r.value)).filter(|(_,id)| cursor.offset == 0 || *id < cursor.offset).collect::<Vec<_>>()
+                } else {
+                    self.store
+                        .sqlite()?
+                        .prepare(sql)?
+                        .query_map(params![cursor.snapshot, prefix, cursor.offset], |r| {
+                            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                        })?
+                        .collect::<rusqlite::Result<_>>()?
+                };
                 let start = std::time::Instant::now();
                 let mut bytes = 0;
                 for (index, (id, message_id)) in candidates.iter().enumerate() {
@@ -536,12 +578,21 @@ impl Archive {
             Browse::Conversations { folder } => {
                 // All observed peer keys participate, even if dialog/profile collection was incomplete.
                 let sql = "SELECT DISTINCT CASE WHEN instr(key,'/')>0 THEN substr(key,1,instr(key,'/')-1) ELSE key END AS peer FROM observations WHERE id<=?1 AND (key LIKE 'user:%' OR key LIKE 'chat:%' OR key LIKE 'channel:%') ORDER BY peer LIMIT ?2 OFFSET ?3";
-                let mut st = self.db.prepare(sql)?;
-                let peers = st
-                    .query_map(params![cursor.snapshot, 1001, cursor.offset], |r| {
-                        r.get::<_, String>(0)
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let peers = if let Some(db) = self.store.clickhouse() {
+                    #[derive(Deserialize, clickhouse::Row)]
+                    struct Peer {
+                        peer: String,
+                    }
+                    db.query::<Peer>(format!("SELECT DISTINCT splitByChar('/',key)[1] AS peer FROM {} WHERE id<=? AND (key LIKE 'user:%' OR key LIKE 'chat:%' OR key LIKE 'channel:%') ORDER BY peer LIMIT 1001 OFFSET {}",db.source("observations",CATALOG)?,cursor.offset),vec![json!(cursor.snapshot)])?.into_iter().map(|r| r.peer).collect::<Vec<_>>()
+                } else {
+                    self.store
+                        .sqlite()?
+                        .prepare(sql)?
+                        .query_map(params![cursor.snapshot, 1001, cursor.offset], |r| {
+                            r.get::<_, String>(0)
+                        })?
+                        .collect::<rusqlite::Result<_>>()?
+                };
                 for (index, peer) in peers.iter().enumerate() {
                     if page.entries.len() == request.limit || index == 1000 {
                         more = true;
@@ -566,8 +617,10 @@ impl Archive {
                                 });
                         let fallback: bool = if matches {
                             false
+                        } else if let Some(db) = self.store.clickhouse() {
+                            db.number(format!("SELECT toInt64(count()) AS value FROM {} WHERE id<=? AND startsWith(key,?) AND arrayExists(x -> replaceAll(x,'\"','')=?,JSONExtractArrayRaw(metadata,'folder'))",db.source("observations",CATALOG)?),vec![json!(cursor.snapshot),json!(format!("{peer}/")),json!(folder)])? > 0
                         } else {
-                            self.db.query_row("SELECT EXISTS(SELECT 1 FROM observations o,json_each(o.metadata,'$.folder') f WHERE o.id<=?1 AND o.key>=?2 AND o.key<(?2 || char(127)) AND CAST(f.value AS TEXT)=?3)",params![cursor.snapshot,format!("{peer}/"),folder],|r|r.get(0))?
+                            self.store.sqlite()?.query_row("SELECT EXISTS(SELECT 1 FROM observations o,json_each(o.metadata,'$.folder') f WHERE o.id<=?1 AND o.key>=?2 AND o.key<(?2 || char(127)) AND CAST(f.value AS TEXT)=?3)",params![cursor.snapshot,format!("{peer}/"),folder],|r|r.get(0))?
                         };
                         if !matches && !fallback {
                             continue;
@@ -601,13 +654,24 @@ impl Archive {
                 ensure!(peer_from_key(peer) == Some(peer.as_str()), "invalid peer");
                 let prefix = format!("{peer}/");
                 let sql = "WITH candidates AS (SELECT substr(key,instr(key,'/topic:')+7) AS topic,id FROM observations WHERE id<=?1 AND kind='topic' AND key>=?2 AND key<(?2 || char(127)) AND instr(key,'/topic:')>0 UNION ALL SELECT CAST(json_extract(metadata,'$.topic') AS TEXT),NULL FROM observations WHERE id<=?1 AND kind='message' AND key>=?2 AND key<(?2 || char(127)) AND json_extract(metadata,'$.topic') IS NOT NULL) SELECT topic,MAX(id) FROM candidates GROUP BY topic ORDER BY CAST(topic AS INTEGER),topic LIMIT ?3 OFFSET ?4";
-                let mut st = self.db.prepare(sql)?;
-                let topics = st
-                    .query_map(
-                        params![cursor.snapshot, prefix, request.limit + 1, cursor.offset],
-                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)),
-                    )?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let topics = if let Some(db) = self.store.clickhouse() {
+                    #[derive(Deserialize, clickhouse::Row)]
+                    struct Topic {
+                        topic: String,
+                        id: Option<i64>,
+                    }
+                    let source = db.source("observations", CATALOG)?;
+                    db.query::<Topic>(format!("SELECT topic,max(id) AS id FROM (SELECT substring(key,position(key,'/topic:')+7) AS topic,toNullable(id) AS id FROM {source} WHERE kind='topic' AND startsWith(key,?) AND id<=? UNION ALL SELECT replaceAll(JSONExtractRaw(metadata,'topic'),'\"','') AS topic,NULL AS id FROM {source} WHERE kind='message' AND JSONHas(metadata,'topic') AND JSONExtractRaw(metadata,'topic')!='null' AND startsWith(key,?) AND id<=?) GROUP BY topic ORDER BY toInt64OrZero(topic),topic LIMIT {} OFFSET {}",request.limit+1,cursor.offset),vec![json!(prefix),json!(cursor.snapshot),json!(prefix),json!(cursor.snapshot)])?.into_iter().map(|r| (r.topic,r.id)).collect::<Vec<_>>()
+                } else {
+                    self.store
+                        .sqlite()?
+                        .prepare(sql)?
+                        .query_map(
+                            params![cursor.snapshot, prefix, request.limit + 1, cursor.offset],
+                            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)),
+                        )?
+                        .collect::<rusqlite::Result<_>>()?
+                };
                 more = topics.len() > request.limit;
                 for (topic, id) in topics.into_iter().take(request.limit) {
                     cursor.offset += 1;
@@ -652,19 +716,28 @@ impl Archive {
                     _ => String::new(),
                 };
                 let sql = "WITH ranked AS (SELECT id,key,ROW_NUMBER() OVER(PARTITION BY key ORDER BY partial ASC,COALESCE(json_extract(metadata,'$.revision'),observed) DESC,id DESC) AS rank FROM observations WHERE id<=?1 AND kind=?2 AND substr(key,1,length(?3))=?3) SELECT id FROM ranked WHERE rank=1 ORDER BY key LIMIT ?4 OFFSET ?5";
-                let mut st = self.db.prepare(sql)?;
-                let ids = st
-                    .query_map(
-                        params![
-                            cursor.snapshot,
-                            kind,
-                            prefix,
-                            request.limit + 1,
-                            cursor.offset
-                        ],
-                        |r| r.get::<_, i64>(0),
-                    )?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let ids = if let Some(db) = self.store.clickhouse() {
+                    #[derive(Deserialize, clickhouse::Row)]
+                    struct Id {
+                        id: i64,
+                    }
+                    db.query::<Id>(format!("SELECT id FROM {} WHERE id<=? AND kind=? AND startsWith(key,?) QUALIFY row_number() OVER (PARTITION BY key ORDER BY partial,{revision} DESC,id DESC)=1 ORDER BY key LIMIT {} OFFSET {}",db.source("observations",CATALOG)?,request.limit+1,cursor.offset),vec![json!(cursor.snapshot),json!(kind),json!(prefix)])?.into_iter().map(|r| r.id).collect::<Vec<_>>()
+                } else {
+                    self.store
+                        .sqlite()?
+                        .prepare(sql)?
+                        .query_map(
+                            params![
+                                cursor.snapshot,
+                                kind,
+                                prefix,
+                                request.limit + 1,
+                                cursor.offset
+                            ],
+                            |r| r.get::<_, i64>(0),
+                        )?
+                        .collect::<rusqlite::Result<_>>()?
+                };
                 more = ids.len() > request.limit;
                 for id in ids.into_iter().take(request.limit) {
                     cursor.offset += 1;
@@ -701,8 +774,21 @@ impl Archive {
         key: &str,
         snapshot: i64,
     ) -> Result<Option<tg_backup_protocol::Record>> {
+        if self.store.clickhouse().is_some() {
+            let mut q = crate::query::Query {
+                key: Some(key.into()),
+                limit: 1,
+                ..Default::default()
+            };
+            q.scan_limit = 1;
+            return Ok(self
+                .query(&q)?
+                .records
+                .into_iter()
+                .find(|r| r.sequence <= snapshot));
+        }
         use rusqlite::OptionalExtension;
-        let id = self.db.query_row("SELECT id FROM observations WHERE key=?1 AND id<=?2 ORDER BY partial ASC,COALESCE(json_extract(metadata,'$.revision'),observed) DESC,id DESC LIMIT 1", params![key,snapshot], |r| r.get(0)).optional()?;
+        let id = self.store.sqlite()?.query_row("SELECT id FROM observations WHERE key=?1 AND id<=?2 ORDER BY partial ASC,COALESCE(json_extract(metadata,'$.revision'),observed) DESC,id DESC LIMIT 1", params![key,snapshot], |r| r.get(0)).optional()?;
         id.map(|id| self.record(id)).transpose()
     }
     pub fn explorer_binary(&self, request: &BinaryRequest) -> Result<BinaryPage> {
@@ -727,23 +813,7 @@ impl Archive {
                 )
             }
             BinaryRef::Attachment { hash } => {
-                let exists: bool = self.db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM media WHERE hash=?1 AND status='complete')",
-                    [hash],
-                    |r| r.get(0),
-                )?;
-                let representations: bool = self.db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='representations')",
-                    [],
-                    |r| r.get(0),
-                )?;
-                let derivative = representations
-                    && self.db.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM representations WHERE hash=?1)",
-                        [hash],
-                        |r| r.get::<_, bool>(0),
-                    )?;
-                ensure!(exists || derivative, "attachment unavailable");
+                ensure!(self.has_attachment(hash)?, "attachment unavailable");
                 let path = crate::media::attachment_path(&self.root, hash)?;
                 let mut file = std::fs::File::open(path)?;
                 let total = file.metadata()?.len();
@@ -764,6 +834,9 @@ impl Archive {
                     *generation == self.explorer_generation()?,
                     "storage generation changed; refresh"
                 );
+                if self.store.clickhouse().is_some() {
+                    return self.ch_binary_cell(database, table, *row, column, request);
+                }
                 let db = self.explorer_database(database)?;
                 let columns = Self::explorer_columns(&db, table)?;
                 ensure!(columns.iter().any(|c| c.name == *column), "unknown column");
@@ -877,5 +950,284 @@ impl<'a> Deadline<'a> {
 impl Drop for Deadline<'_> {
     fn drop(&mut self) {
         let _ = self.0.progress_handler(0, None::<fn() -> bool>);
+    }
+}
+
+impl Archive {
+    fn ch_scope(&self, database: &str) -> Result<String> {
+        if database == CATALOG {
+            return Ok(CATALOG.into());
+        }
+        let id = database
+            .strip_prefix("epoch:")
+            .context("unknown database")?
+            .parse::<i64>()?;
+        Ok(self
+            .store
+            .get::<EpochRow>("id", id)?
+            .context("unknown epoch")?
+            .path)
+    }
+    fn ch_tables(&self, database: &str, page: &mut BrowsePage) -> Result<()> {
+        let scope = self.ch_scope(database)?;
+        for table in TABLES.iter().filter(|t| {
+            if scope == CATALOG {
+                !["blocks", "dictionaries"].contains(t)
+            } else {
+                [
+                    "schemas",
+                    "blocks",
+                    "dictionaries",
+                    "payloads",
+                    "observations",
+                ]
+                .contains(t)
+            }
+        }) {
+            let (columns, keys) = table_columns(table)?;
+            let columns = columns
+                .into_iter()
+                .map(|(name, ty)| Column {
+                    name: name.into(),
+                    declared_type: ty.into(),
+                    primary_key: keys.contains(&name),
+                })
+                .collect::<Vec<_>>();
+            let mut entry = Entry::new(
+                *table,
+                *table,
+                json!({"columns":columns,"backend":"clickhouse"}),
+            );
+            entry.open = Some(Browse::Rows {
+                database: database.into(),
+                table: (*table).into(),
+                row: None,
+            });
+            page.entries.push(entry);
+        }
+        Ok(())
+    }
+    fn storage_row_id(&self, table: &str, field: &str, value: &str) -> Result<i64> {
+        let (columns, _) = table_columns(table)?;
+        ensure!(
+            columns.iter().any(|(name, _)| *name == field),
+            "unknown column"
+        );
+        if let Some(db) = self.store.clickhouse() {
+            db.number(
+                format!(
+                    "SELECT toInt64(_row) AS value FROM {} WHERE {}=?",
+                    db.source(table, CATALOG)?,
+                    quoted(field)
+                ),
+                vec![json!(value)],
+            )
+        } else {
+            Ok(self.store.sqlite()?.query_row(
+                &format!(
+                    "SELECT rowid FROM {} WHERE {}=?1",
+                    quoted(table),
+                    quoted(field)
+                ),
+                [value],
+                |r| r.get(0),
+            )?)
+        }
+    }
+    fn ch_rows(
+        &self,
+        database: &str,
+        table: &str,
+        row: Option<i64>,
+        request: &BrowseRequest,
+        cursor: &mut Cursor,
+        page: &mut BrowsePage,
+    ) -> Result<bool> {
+        #[derive(Deserialize, clickhouse::Row)]
+        struct Preview {
+            row: i64,
+            json_data: String,
+            json_sizes: String,
+        }
+        ensure!(TABLES.contains(&table), "table is not exposed");
+        let scope = self.ch_scope(database)?;
+        let db = self.store.clickhouse().context("ClickHouse storage")?;
+        let (columns, keys) = table_columns(table)?;
+        page.columns = columns
+            .iter()
+            .map(|(name, ty)| Column {
+                name: (*name).into(),
+                declared_type: (*ty).into(),
+                primary_key: keys.contains(name),
+            })
+            .collect();
+        let fields = columns
+            .iter()
+            .map(|(name, ty)| {
+                if *ty == "Array(UInt8)" {
+                    "[]".into()
+                } else if ty.contains("String") {
+                    format!("substring({},1,4096)", quoted(name))
+                } else {
+                    quoted(name)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let sizes = columns
+            .iter()
+            .map(|(name, ty)| {
+                if ty.contains("String") || *ty == "Array(UInt8)" {
+                    format!("length({})", quoted(name))
+                } else {
+                    "0".into()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let filter = if table == "checkpoints" {
+            " AND NOT startsWith(key,'takeout:')"
+        } else {
+            ""
+        };
+        let fetch_limit = if request.search.is_empty() {
+            request.limit + 1
+        } else {
+            1001
+        };
+        let rows = db.query::<Preview>(format!("SELECT _row AS row,toJSONString(tuple({fields})) AS json_data,toJSONString(tuple({sizes})) AS json_sizes FROM {} WHERE _row>?{}{} ORDER BY _row LIMIT {fetch_limit} SETTINGS output_format_json_named_tuples_as_objects=1,output_format_json_quote_64bit_integers=0",db.source(table,&scope)?,row.map(|id| format!(" AND _row={id}")).unwrap_or_default(),filter),vec![json!(cursor.offset)])?;
+        let more = rows.len() == fetch_limit;
+        let mut bytes = 0;
+        for (index, row) in rows.into_iter().enumerate() {
+            if page.entries.len() == request.limit || bytes >= 1024 * 1024 || index == 10000 {
+                page.incomplete = true;
+                return Ok(true);
+            }
+            cursor.offset = row.row;
+            let data: Vec<Value> = serde_json::from_str(&row.json_data)?;
+            let sizes: Vec<Value> = serde_json::from_str(&row.json_sizes)?;
+            let mut cells = serde_json::Map::new();
+            let mut binaries = vec![];
+            for (index, (name, ty)) in columns.iter().enumerate() {
+                let reference = BinaryRef::Cell {
+                    database: database.into(),
+                    table: table.into(),
+                    row: row.row,
+                    column: (*name).into(),
+                    generation: cursor.generation.clone(),
+                };
+                let size = sizes[index].as_u64().unwrap_or(0);
+                let cell = if *ty == "Array(UInt8)" {
+                    binaries.push(reference.clone());
+                    Cell::Blob {
+                        bytes: size,
+                        reference,
+                    }
+                } else if data[index].is_null() {
+                    Cell::Null
+                } else if ty.contains("String") {
+                    binaries.push(reference.clone());
+                    if size > 4096 {
+                        Cell::LargeText {
+                            bytes: size,
+                            reference,
+                        }
+                    } else {
+                        Cell::Text(data[index].as_str().context("text cell")?.into())
+                    }
+                } else {
+                    Cell::Integer(data[index].to_string())
+                };
+                cells.insert((*name).into(), serde_json::to_value(cell)?);
+            }
+            let detail = Value::Object(cells);
+            if !detail
+                .to_string()
+                .to_lowercase()
+                .contains(&request.search.to_lowercase())
+            {
+                continue;
+            }
+            bytes += serde_json::to_vec(&detail)?.len();
+            let mut entry = Entry::new(row.row.to_string(), format!("#{}", row.row), detail);
+            entry.binaries = binaries;
+            if table == "observations" {
+                entry.open = Some(Browse::Location { sequence: row.row });
+            }
+            page.entries.push(entry);
+        }
+        Ok(more)
+    }
+    fn ch_binary_cell(
+        &self,
+        database: &str,
+        table: &str,
+        row: i64,
+        column: &str,
+        request: &BinaryRequest,
+    ) -> Result<BinaryPage> {
+        #[derive(Deserialize, clickhouse::Row)]
+        struct Text {
+            total: i64,
+            data: String,
+        }
+        #[derive(Deserialize, clickhouse::Row)]
+        struct Blob {
+            total: i64,
+            data: Vec<u8>,
+        }
+        ensure!(TABLES.contains(&table), "unknown table");
+        let (columns, _) = table_columns(table)?;
+        let ty = columns
+            .iter()
+            .find(|(name, _)| *name == column)
+            .context("unknown column")?
+            .1;
+        ensure!(
+            ty == "Array(UInt8)" || ty.contains("String"),
+            "cell has no binary value"
+        );
+        let db = self.store.clickhouse().context("ClickHouse storage")?;
+        let scope = self.ch_scope(database)?;
+        let filter = if table == "checkpoints" {
+            " AND NOT startsWith(key,'takeout:')"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT toInt64(length({0})) AS total,{1}({0},{2},{3}) AS data FROM {4} WHERE _row=?{filter}",
+            quoted(column),
+            if ty == "Array(UInt8)" {
+                "arraySlice"
+            } else {
+                "substring"
+            },
+            request.offset + 1,
+            request.limit,
+            db.source(table, &scope)?
+        );
+        let (total, bytes) = if ty == "Array(UInt8)" {
+            let row = db
+                .query::<Blob>(sql, vec![json!(row)])?
+                .into_iter()
+                .next()
+                .context("cell missing")?;
+            (row.total, row.data)
+        } else {
+            let row = db
+                .query::<Text>(sql, vec![json!(row)])?
+                .into_iter()
+                .next()
+                .context("cell missing")?;
+            (row.total, row.data.into_bytes())
+        };
+        let total = u64::try_from(total)?;
+        ensure!(request.offset <= total, "offset beyond cell");
+        let end = request.offset + bytes.len() as u64;
+        Ok(BinaryPage {
+            hex: hex::encode(bytes),
+            total,
+            next_offset: (end < total).then_some(end),
+        })
     }
 }

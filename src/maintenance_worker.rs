@@ -14,38 +14,35 @@ pub fn execute(root: &Path, task: &Task) -> Result<Value> {
     if staging.exists() {
         std::fs::remove_dir_all(&staging)?;
     }
-    drop(Archive::init(&staging, &source.config)?);
-    source
-        .db
-        .backup("main", staging.join("catalog.sqlite3"), None)?;
-    for (_, _, path, _) in source.epochs()? {
-        let input = Connection::open_with_flags(
-            root.join(&path),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
-        input.backup("main", staging.join(path), None)?;
-    }
-    let mut st=source.db.prepare("SELECT DISTINCT hash FROM media WHERE status='complete' UNION SELECT hash FROM representations")?;
-    for hash in st.query_map([], |r| r.get::<_, String>(0))? {
-        let hash = hash?;
-        let from = crate::media::attachment_path(root, &hash)?;
-        let to = crate::media::attachment_path(&staging, &hash)?;
-        std::fs::create_dir_all(to.parent().unwrap())?;
-        std::fs::hard_link(from, to)?;
+    if source.store.clickhouse().is_some() {
+        drop(crate::migration::snapshot(&source, &staging)?);
+    } else {
+        drop(Archive::init(&staging, &source.config)?);
+        source
+            .store
+            .sqlite()?
+            .backup("main", staging.join("catalog.sqlite3"), None)?;
+        for (_, _, path, _) in source.epochs()? {
+            let input = Connection::open_with_flags(
+                root.join(&path),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            input.backup("main", staging.join(path), None)?;
+        }
+        for hash in source.complete_attachment_hashes()? {
+            let from = crate::media::attachment_path(root, &hash)?;
+            let to = crate::media::attachment_path(&staging, &hash)?;
+            std::fs::create_dir_all(to.parent().unwrap())?;
+            std::fs::hard_link(from, to)?;
+        }
     }
     let generation = source.checkpoint("maintenance_generation")?;
-    let high: i64 =
-        source
-            .db
-            .query_row("SELECT COALESCE(MAX(id),0) FROM observations", [], |r| {
-                r.get(0)
-            })?;
-    drop(st);
+    let high = source.observation_high_water()?;
     drop(source);
     let mut snapshot = Archive::open(&staging, true)?;
     let result = if task.kind == "reindex" {
         // Keep ordinary text rows only inside this private, temporary worker result.
-        snapshot.db.execute_batch(
+        snapshot.store.sqlite()?.execute_batch(
             "CREATE TABLE IF NOT EXISTS rebuilt_text(id INTEGER PRIMARY KEY,text TEXT NOT NULL);",
         )?;
         let mut after = 0;
@@ -57,7 +54,7 @@ pub fn execute(root: &Path, task: &Task) -> Result<Value> {
             for id in ids {
                 after = id;
                 let record = snapshot.record(id)?;
-                snapshot.db.execute(
+                snapshot.store.sqlite()?.execute(
                     "INSERT OR REPLACE INTO rebuilt_text VALUES(?1,?2)",
                     params![id, crate::tl::text(&record.data)],
                 )?;
@@ -73,7 +70,8 @@ pub fn execute(root: &Path, task: &Task) -> Result<Value> {
         })?
     };
     snapshot
-        .db
+        .store
+        .sqlite()?
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
     Ok(
         json!({"state":"complete","snapshot":format!("work-{}",task.sequence),"high_water":high,"generation":generation,"result":result}),
@@ -95,10 +93,17 @@ pub fn publish(a: &mut Archive, task: &Task, report: &Value) -> Result<()> {
     );
     let root = a.root.join("staging").join(name);
     let snapshot = Archive::open(&root, false)?;
+    if a.store.clickhouse().is_some() {
+        a.ch_publish_generation(&snapshot, task.kind == "reindex", false)?;
+        drop(snapshot);
+        std::fs::remove_dir_all(root)?;
+        return Ok(());
+    }
     if task.kind == "reindex" {
-        let tx = a.db.transaction()?;
+        let tx = a.store.sqlite_mut()?.transaction()?;
         let mut st = snapshot
-            .db
+            .store
+            .sqlite()?
             .prepare("SELECT id,text FROM rebuilt_text ORDER BY id")?;
         let mut rows = st.query([])?;
         while let Some(row) = rows.next()? {
@@ -132,14 +137,15 @@ pub fn publish(a: &mut Archive, task: &Task, report: &Value) -> Result<()> {
             paths.push((id, name, dest));
         }
         sync_dir(&a.root.join("epochs"))?;
-        let tx = a.db.transaction()?;
+        let tx = a.store.sqlite_mut()?.transaction()?;
         let mut mapping = std::collections::BTreeMap::new();
         for (id, name, path) in paths {
             tx.execute("INSERT INTO epochs(name,path,sealed,generation,accepting,part) VALUES(?1,?2,1,1,0,1)",params![name,path])?;
             mapping.insert(id, tx.last_insert_rowid());
         }
         let mut st = snapshot
-            .db
+            .store
+            .sqlite()?
             .prepare("SELECT hash,epoch,block,offset,length FROM payloads")?;
         let mut rows = st.query([])?;
         while let Some(row) = rows.next()? {
@@ -148,7 +154,8 @@ pub fn publish(a: &mut Archive, task: &Task, report: &Value) -> Result<()> {
             tx.execute("UPDATE payloads SET epoch=?2,block=?3,offset=?4,length=?5,journal=NULL WHERE hash=?1",params![hash,mapping[&epoch],row.get::<_,i64>(2)?,row.get::<_,i64>(3)?,row.get::<_,i64>(4)?])?;
         }
         let mut st = snapshot
-            .db
+            .store
+            .sqlite()?
             .prepare("SELECT id,epoch,payload FROM observations")?;
         let mut rows = st.query([])?;
         while let Some(row) = rows.next()? {

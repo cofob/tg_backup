@@ -1,12 +1,12 @@
 # tg_backup v2
 
-A Rust Telegram cloud archive. Native Telegram TL payloads are stored in zstd-compressed blocks inside **separate SQLite databases for each epoch**. Attachments are stored as deduplicated files. The archive retains observed object versions, observations, presence/read-state changes, and authoritative deletion events.
+A Rust Telegram cloud archive. Native Telegram TL payloads are stored in zstd-compressed blocks. SQLite uses **separate databases for each epoch**. ClickHouse is an optional second backend. Attachments are stored as deduplicated files. The archive retains observed object versions, observations, presence/read-state changes, and authoritative deletion events.
 
 V2 starts a new archive dataset and does not import v1 backup data. A standalone migration script can reuse a v1 Python/Kurigram authorization session. V1 is available in Git history.
 
 ## Build and start
 
-Requires Rust 1.88 or newer and a C/C++ toolchain. CI uses Rust 1.98.1 on Linux and macOS. SQLite and zstd are bundled dependencies.
+Requires Rust 1.89 or newer and a C/C++ toolchain. CI uses Rust 1.98.1 on Linux and macOS. SQLite and zstd are bundled dependencies.
 
 ```sh
 cargo build --locked --release --workspace --bins
@@ -23,7 +23,95 @@ tg-backup --dataset ./dataset sync --takeout
 
 Obtain API credentials from [my.telegram.org](https://my.telegram.org/). Login prompts for the Telegram code and, if required, a 2FA password. Password entry is masked; `TG_BACKUP_PASSWORD` is also accepted. Authentication/session secrets are stored in `session.sqlite3`, separately from queryable archive data.
 
-### Migrate a v1 session
+### Storage backends and migration
+
+SQLite is the default. Old configuration files still open as SQLite. Both
+backends support sync, resume, queries, exports, the TUI, media, and the work queue.
+Telegram authorization stays in the local `session.sqlite3` file.
+
+ClickHouse needs server 26.8.2.7 or newer. The normal build includes the official
+Rust HTTP/HTTPS client. SQLite does not need a ClickHouse server.
+
+```sh
+docker compose --profile clickhouse up -d clickhouse
+tg-backup --dataset ./ch init --backend clickhouse \
+  --clickhouse-url http://127.0.0.1:8123 --clickhouse-user tg_backup \
+  --clickhouse-database telegram_archive
+# setup accepts the same backend and connection options.
+```
+
+Use `--clickhouse-password-file /private/path/password` to read a password. The
+file is a credential reference. It must have private permissions. For the Compose
+coordinator, use `http://clickhouse:8123` in its configuration. Set
+`TG_BACKUP_CLICKHOUSE_PASSWORD` before you start a password-protected server.
+Each dataset uses a separate ClickHouse database. Its configuration has:
+
+```toml
+backend = "clickhouse"
+# dataset_id is assigned during initialization.
+[clickhouse]
+url = "https://clickhouse.example:8443"
+database = "telegram_archive"
+user = "tg_backup"
+timeout_seconds = 30
+# password = { provider = "file", path = "/private/path/password" }
+```
+
+ClickHouse stores native archive rows, compressed blocks, and queue state.
+Durable batch intents and commit markers publish observations and checkpoints
+together. Reads use committed row versions at a fixed snapshot. A writer completes
+pending intents before it writes more data. Keep one coordinator for each dataset;
+all processes must use the same dataset directory and locks.
+
+Maintenance builds a private SQLite staging dataset to reuse the retention and
+compression code. It verifies this generation before it publishes its payload and
+epoch references to ClickHouse. New ingestion, checkpoints, jobs, and work state
+stay in the live dataset. Publication invalidates old cursors. Old physical row
+versions and batch bodies are removed after publication with the reader lock held.
+
+Stop the source coordinator before migration. These commands create a separate
+target and leave the source unchanged:
+
+```sh
+tg-backup --dataset ./sqlite migrate --to clickhouse --output ./ch \
+  --clickhouse-url http://127.0.0.1:8123 --clickhouse-user tg_backup \
+  --clickhouse-database telegram_archive
+tg-backup --dataset ./ch migrate --to sqlite --output ./sqlite-copy
+# After interruption, repeat the same command with --resume.
+```
+
+Migration reads private copies of local SQLite files in the system temporary
+directory. Allow temporary disk space for those files.
+
+Migration copies schemas, observations, payloads, pending journals, compressed
+blocks and dictionaries, epochs, checkpoints, queue state, media references,
+representations, and attachments. It keeps record IDs, timestamps, hashes, and
+resume counters. It pauses running jobs and queues running work. The target has a
+new dataset ID. Its search indexes are rebuilt. A progress file keeps an incomplete
+target closed. Resume rejects a changed source snapshot or an unrelated target.
+The CLI shows a progress bar on terminal stderr and keeps stdout for the JSON
+result. Count, row hash, payload, and reference checks must pass before the target is ready.
+SQLite targets use archive format 2. ClickHouse uses storage schema 1.
+
+Credential references stay unchanged. Migration copies local private credential
+files and uses SQLite backup for the session. If a credential reference points
+outside the dataset, keep that credential file available to the target.
+
+For a ClickHouse backup, stop the coordinator and migrate to a new SQLite dataset.
+Copy that whole target directory to backup storage. To restore, migrate that SQLite
+backup to an empty ClickHouse database and a new local dataset directory. This also
+copies the local session and attachments. A server backup alone does not include
+those local files. The optional Compose profile keeps server data in the persistent
+`clickhouse` volume.
+
+Run the default suite without a server. To run the same shared behavior and
+migration tests with ClickHouse:
+
+```sh
+TG_BACKUP_CLICKHOUSE_URL=http://127.0.0.1:8123 cargo test --locked --test backends
+```
+
+## Migrate a v1 session
 
 The dependency-free Python 3.11+ migrator transfers the Telegram authorization key and compatible peer cache from a v1 Kurigram/Pyrogram session. It does not migrate archived messages or files. Initialize an empty v2 dataset, run the migrator, then provide the API hash that belonged to the v1 application:
 
@@ -222,7 +310,13 @@ tg-backup export --kind message --format txt --output messages.txt
 
 Observation timestamps and `--as-of` use UTC microseconds. Results include source, TL root/schema identity, full decoded TL data, attachment content hashes, and flags for partial/deleted/compacted records. Telegram ID fields are strings at the public JSON boundary. TL byte fields appear as `{"$bytes":"hex..."}`.
 
-Current text uses contentless SQLite FTS5 indexes, avoiding a second stored copy of message text; queries use FTS5 syntax. Historical text uses the same tokenizer, with compressed scans unless `index_history = true`; run `maintenance reindex` after enabling that option. Regex uses Rust's regex syntax. Query pages enforce record/scan limits, time and response-size budgets, and return `next_cursor`, `incomplete`, and `scanned`. Pass the exact same query with `--cursor` to continue. Cursors freeze an observation high-water mark and are invalidated by generation replacement. Exports follow cursors until complete.
+SQLite text uses contentless FTS5 indexes, avoiding a second stored copy of message text; queries use FTS5 syntax. Historical text uses the same tokenizer, with compressed scans unless `index_history = true`; run `maintenance reindex` after enabling that option. ClickHouse text uses its native text index with ICU Unicode tokenization and
+`lowerUTF8` case normalization. Plain text requires all words, in any order. A
+whole query in double quotes requires consecutive words. For example,
+`--text 'hello world'` matches both words; `--text '"hello world"'` matches the
+phrase. ClickHouse does not accept FTS5 operators such as `OR`, `NEAR`, or prefix
+wildcards. Historical reads use the same native matcher; `index_history` controls
+whether they use the text index. Regex uses Rust's regex syntax. Query pages enforce record/scan limits, time and response-size budgets, and return `next_cursor`, `incomplete`, and `scanned`. Pass the exact same query with `--cursor` to continue. Cursors freeze an observation high-water mark and are invalidated by generation replacement. Exports follow cursors until complete.
 
 JSON/NDJSON retain all fields in the selected records. TXT/HTML are readable projections. Use `--all-versions` for complete retained history; the default query/export view is current objects.
 
@@ -510,7 +604,7 @@ references with bounded offsets/lengths. There are no arbitrary SQL or file-path
 endpoints. Existing server authentication applies. Older servers retain record
 browsing and existing-format exports; explorer-specific features require an
 updated server. See [vendor/README.md](vendor/README.md) for the small upstream
-compatibility patches needed by the dependency policy and Rust 1.88 baseline.
+compatibility patches needed by the dependency policy and Rust 1.89 baseline.
 
 ## Offline social graph
 

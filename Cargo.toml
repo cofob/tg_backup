@@ -5,11 +5,11 @@ exclude = ["vendor/ratatui-image", "vendor/kasuari"]
 
 [package]
 name = "tg-backup"
-version = "2.4.8"
+version = "2.5.0"
 edition = "2024"
 publish = false
-rust-version = "1.88"
-description = "Lossless Telegram TL archives in compressed SQLite epochs"
+rust-version = "1.89"
+description = "Lossless Telegram TL archives in SQLite or ClickHouse"
 
 [lib]
 name = "tg_backup"
@@ -19,15 +19,16 @@ name = "tg-backup"
 path = "src/bin/tg-backup.rs"
 
 [dependencies]
-tg-backup-tui = { version = "2.4.8", path = "crates/tui" }
-tg-backup-credentials = { version = "2.4.8", path = "crates/credentials" }
-tg-backup-protocol = { version = "2.4.8", path = "crates/protocol" }
+tg-backup-tui = { version = "2.5.0", path = "crates/tui" }
+tg-backup-credentials = { version = "2.5.0", path = "crates/credentials" }
+tg-backup-protocol = { version = "2.5.0", path = "crates/protocol" }
 anyhow = "1"
 axum = "0.8"
 base64 = "0.22"
 blake3 = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "=4.6.3", features = ["derive"] }
+clickhouse = { version = "=0.15.2", features = ["rustls-tls"] }
 fs2 = "0.4"
 grammers-client = "=0.10.0"
 grammers-mtsender = "=0.10.0"

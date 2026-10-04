@@ -1,9 +1,9 @@
 [package]
 name = "tg-backup-tui"
-version = "2.4.8"
+version = "2.5.0"
 edition = "2024"
 publish = false
-rust-version = "1.88"
+rust-version = "1.89"
 
 [dependencies]
 tg-backup-protocol = { path = "../protocol", version = "2.4.1" }

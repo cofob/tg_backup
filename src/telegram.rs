@@ -1,4 +1,5 @@
 //! Read-only Telegram capture. Every collector archives native TL before advancing its cursor.
+use crate::storage::{Select, rows::*};
 mod extra;
 use crate::session::SqliteSession;
 use crate::{
@@ -16,7 +17,6 @@ use grammers_session::{
     updates::MessageBox,
 };
 use grammers_tl_types::{Deserializable, Serializable};
-use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -224,14 +224,8 @@ fn prepare_sync_job(archive: &mut Archive, options: &mut SyncOptions) -> Result<
         options.max_seconds,
     );
     if options.resume.is_none() && !options.new_job {
-        let mut statement = archive.db.prepare(
-            "SELECT id,config FROM jobs WHERE status IN ('running','paused','failed') ORDER BY updated DESC,created DESC,rowid DESC",
-        )?;
-        let jobs = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for job in jobs {
-            let (id, config) = job?;
+        for row in archive.unfinished_jobs()? {
+            let (id, config) = (row.id, row.config);
             let stored: SyncOptions = serde_json::from_str(&config)
                 .with_context(|| format!("invalid config for sync job {id}"))?;
             if options.continuous == stored.continuous
@@ -263,10 +257,7 @@ fn prepare_sync_job(archive: &mut Archive, options: &mut SyncOptions) -> Result<
         }
     }
     let job = if let Some(job) = &options.resume {
-        let stored: String = archive
-            .db
-            .query_row("SELECT config FROM jobs WHERE id=?1", [job], |r| r.get(0))
-            .context("unknown job")?;
+        let stored = archive.job(job)?.config;
         let job = job.clone();
         *options = serde_json::from_str(&stored)?;
         options.resume = Some(job.clone());
@@ -292,7 +283,7 @@ fn prepare_sync_job(archive: &mut Archive, options: &mut SyncOptions) -> Result<
     // Persist resolved selectors so a resume is independent of subsequent config edits.
     options.history_selector = Some(archive.config.history_selector.clone());
     options.attachment_selector = Some(archive.config.attachment_selector.clone());
-    archive.db.execute("INSERT INTO jobs VALUES(?1,?2,'running',?3,?3,'{}') ON CONFLICT(id) DO UPDATE SET status='running',config=excluded.config,updated=excluded.updated",params![job,serde_json::to_string(&options)?,now()])?;
+    archive.start_job(&job, &serde_json::to_value(&options)?, now())?;
     archive.set_checkpoint(&format!("pause_reason:{job}"), &Value::Null)?;
     if options.resume.is_some() {
         tracing::info!(%job, "sync job resumed");
@@ -304,7 +295,7 @@ fn prepare_sync_job(archive: &mut Archive, options: &mut SyncOptions) -> Result<
 
 pub async fn sync(root: &Path, mut options: SyncOptions) -> Result<()> {
     let mut archive = Archive::open(root, true)?;
-    archive.db.execute_batch("CREATE TABLE IF NOT EXISTS peers(key TEXT PRIMARY KEY,input TEXT NOT NULL,metadata TEXT NOT NULL,raw TEXT NOT NULL); CREATE TABLE IF NOT EXISTS folders(id TEXT PRIMARY KEY,data TEXT NOT NULL);")?;
+    archive.store.ensure_peers()?;
     let job = prepare_sync_job(&mut archive, &mut options)?;
     let (id, _) = credentials(root).await?;
     let session = Arc::new(SqliteSession::open(root.join("session.sqlite3")).await?);
@@ -361,12 +352,8 @@ pub async fn sync(root: &Path, mut options: SyncOptions) -> Result<()> {
         state
     };
     {
-        let mut statement = archive.db.prepare("SELECT raw FROM peers")?;
-        let rows = statement
-            .query_map([], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(statement);
-        for raw in rows {
+        for row in archive.peers()? {
+            let raw = row.raw;
             let value: Value = serde_json::from_str(&raw)?;
             let root = if value["_"] == "user" { "User" } else { "Chat" };
             let bytes = schema.encode(root, &value)?;
@@ -577,11 +564,9 @@ pub async fn sync(root: &Path, mut options: SyncOptions) -> Result<()> {
     } else {
         "exhausted"
     };
-    let failed_media: i64 = archive.db.query_row(
-        "SELECT COUNT(*) FROM media WHERE status='failed'",
-        [],
-        |r| r.get(0),
-    )?;
+    let failed_media = archive
+        .store
+        .count::<MediaRow>(&Select::eq("status", "failed"))?;
     archive.coverage(
         "media",
         if failed_media > 0 {
@@ -591,7 +576,26 @@ pub async fn sync(root: &Path, mut options: SyncOptions) -> Result<()> {
         },
         &json!({"failed":failed_media}),
     )?;
-    let incomplete:i64=archive.db.query_row("SELECT COUNT(*) FROM coverage WHERE status IN ('incomplete','failed_or_inaccessible','recovery_error','waiting_or_failed','inaccessible','limited','unsupported','requires_takeout','not_started','in_progress')",[],|r|r.get(0))?;
+    let incomplete = archive
+        .store
+        .all::<CoverageRow>()?
+        .iter()
+        .filter(|r| {
+            [
+                "incomplete",
+                "failed_or_inaccessible",
+                "recovery_error",
+                "waiting_or_failed",
+                "inaccessible",
+                "limited",
+                "unsupported",
+                "requires_takeout",
+                "not_started",
+                "in_progress",
+            ]
+            .contains(&r.status.as_str())
+        })
+        .count();
     let status = if update_failed || stop_reason == "error" {
         "failed"
     } else if stop_reason != "exhausted" {
@@ -601,7 +605,7 @@ pub async fn sync(root: &Path, mut options: SyncOptions) -> Result<()> {
     } else {
         "complete"
     };
-    archive.db.execute("UPDATE jobs SET status=?2,updated=?3,details=json_patch(details,?4) WHERE id=?1",params![job,status,now(),json!({"stop_reason":stop_reason,"result":result.as_ref().err().map(ToString::to_string),"resume":format!("tg-backup sync --resume {job}")}).to_string()])?;
+    archive.patch_job(&job,Some(status),&json!({"stop_reason":stop_reason,"result":result.as_ref().err().map(ToString::to_string),"resume":format!("tg-backup sync --resume {job}")}),now())?;
     result
 }
 fn encode_state(s: &UpdatesState) -> Value {
@@ -629,17 +633,13 @@ fn decode_state(v: &Value) -> Result<UpdatesState> {
 impl Engine {
     fn progress(&self, phase: &str, peers_done: u64, peers_total: Option<u64>) -> Result<()> {
         let a = self.archive.lock().unwrap();
-        a.db.execute(
-            "UPDATE jobs SET details=json_set(details,'$.requests_finished',0,'$.requests_failed',0,'$.active_method',NULL) WHERE id=?1 AND COALESCE(json_extract(details,'$.phase'),'') != ?2",
-            params![self.job, phase],
-        )?;
         let messages = a
             .checkpoint(&format!("messages:{}", self.job))?
             .unwrap_or(json!(0));
         let media = a
             .checkpoint(&format!("media_bytes:{}", self.job))?
             .unwrap_or(json!(0));
-        a.db.execute("UPDATE jobs SET updated=?2,details=json_set(json_patch(details,?3),'$.peers_discovered',json_extract(?3,'$.peers_discovered'),'$.total_messages',NULL) WHERE id=?1",params![self.job,now(),json!({"phase":phase,"peers_visited":peers_done,"peers_discovered":peers_total,"messages_scanned":messages,"media_bytes":media,"elapsed_seconds":self.started.elapsed().as_secs(),"continuous":self.options.continuous,"total_messages":null}).to_string()])?;
+        a.job_progress(&self.job,&json!({"phase":phase,"peers_visited":peers_done,"peers_discovered":peers_total,"messages_scanned":messages,"media_bytes":media,"elapsed_seconds":self.started.elapsed().as_secs(),"continuous":self.options.continuous,"total_messages":null}),now())?;
         Ok(())
     }
     fn check_stop(&self) -> Result<()> {
@@ -681,14 +681,7 @@ impl Engine {
         let media = a
             .checkpoint(&format!("media_bytes:{}", self.job))?
             .unwrap_or(json!(0));
-        a.db.execute(
-            "UPDATE jobs SET updated=?2,details=json_set(details,
-             '$.active_method',?3,
-             '$.requests_finished',COALESCE(json_extract(details,'$.requests_finished'),0)+?4,
-             '$.requests_failed',COALESCE(json_extract(details,'$.requests_failed'),0)+?5,
-             '$.elapsed_seconds',?6,'$.messages_scanned',json(?7),'$.media_bytes',json(?8)) WHERE id=?1",
-            params![self.job, now(), method, u64::from(finished), u64::from(failed), self.started.elapsed().as_secs(), messages.to_string(), media.to_string()],
-        )?;
+        a.job_request(&self.job,&json!({"active_method":method,"elapsed_seconds":self.started.elapsed().as_secs(),"messages_scanned":messages,"media_bytes":media}),finished,failed)?;
         Ok(())
     }
 
@@ -797,12 +790,9 @@ impl Engine {
                 {
                     let a = self.archive.lock().unwrap();
                     a.set_checkpoint(&format!("takeout:{}", self.job), &json!({"expired":true}))?;
-                    a.db.execute(
-                        "DELETE FROM checkpoints WHERE key=?1 OR key LIKE ?2",
-                        params![
-                            format!("ranges:{}", self.job),
-                            format!("peer_range:{}:%", self.job)
-                        ],
+                    a.clear_checkpoints(
+                        &format!("ranges:{}", self.job),
+                        &format!("peer_range:{}:", self.job),
                     )?;
                     self.stop.cancel();
                     bail!(
@@ -1088,11 +1078,7 @@ impl Engine {
                 if parent.root == "SavedStarGift" {
                     if let Some(id) = integer(&parent.value["saved_id"]) {
                         if let Some(peer) = scope.split('/').find(|s| s.starts_with("channel:")) {
-                            let input: String = archive.db.query_row(
-                                "SELECT input FROM peers WHERE key=?1",
-                                [peer],
-                                |r| r.get(0),
-                            )?;
+                            let input = archive.peer(peer)?.context("peer not found")?.input;
                             metadata["saved_gift_reference"] = json!({"_":"inputSavedStarGiftChat","peer":serde_json::from_str::<Value>(&input)?,"saved_id":id.to_string()});
                         }
                     } else if let Some(id) = integer(&parent.value["msg_id"]) {
@@ -1171,15 +1157,20 @@ impl Engine {
                 constructor,
                 "dialogFilter" | "dialogFilterChatlist" | "dialogFilterDefault"
             ) {
-                archive.db.execute("INSERT INTO folders VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET data=excluded.data",params![integer(&v["id"]).unwrap_or(0).to_string(),v.to_string()])?;
+                archive.store.put(&FolderRow {
+                    id: integer(&v["id"]).unwrap_or(0).to_string(),
+                    data: v.to_string(),
+                })?;
             }
         }
         if root == "Update" {
-            if value["_"] == "updateDialogFilter" && value["filter"].is_null() {
-                archive.db.execute(
-                    "DELETE FROM folders WHERE id=?1",
-                    [integer(&value["id"]).unwrap_or(0).to_string()],
-                )?;
+            if value["_"] == "updateDialogFilter"
+                && value["filter"].is_null()
+                && let Some(row) = archive
+                    .store
+                    .get::<FolderRow>("id", integer(&value["id"]).unwrap_or(0).to_string())?
+            {
+                archive.store.delete(&row)?;
             }
             let key = peer_key(&value["peer"])
                 .or_else(|| integer(&value["channel_id"]).map(|id| format!("channel:{id}")));
@@ -1189,10 +1180,7 @@ impl Engine {
                 if let Some(unread) = integer(&value["still_unread_count"]) {
                     meta["unread"] = json!(unread > 0);
                 }
-                archive.db.execute(
-                    "UPDATE peers SET metadata=?2 WHERE key=?1",
-                    params![key, meta.to_string()],
-                )?;
+                archive.peer_metadata(&key, &meta)?;
             }
         }
         for update in slices.iter().filter(|s| s.root == "Update") {
@@ -1213,10 +1201,7 @@ impl Engine {
             let data = self.schema.decode(&record.root_type, &record.bytes)?;
             archive.link_media(id, &data)?;
         }
-        archive.db.execute(
-            "UPDATE jobs SET updated=?2 WHERE id=?1",
-            params![self.job, now()],
-        )?;
+        archive.patch_job(&self.job, None, &json!({}), now())?;
         archive.materialize_if_ready()?;
         Ok(value)
     }
@@ -1321,8 +1306,7 @@ impl Engine {
             self.archive
                 .lock()
                 .unwrap()
-                .db
-                .execute("UPDATE media SET retry_at=0 WHERE status='deferred'", [])?;
+                .update_media_where(|r| r.status == "deferred", |r| r.retry_at = 0)?;
             self.progress("media", total, Some(total))?;
             self.download_pending().await?;
             self.progress("finalization", total, Some(total))?;
@@ -1339,11 +1323,14 @@ impl Engine {
             if !self.options.continuous {
                 let (pending, paused) = {
                     let a = self.archive.lock().unwrap();
-                    let pending: i64 = a.db.query_row(
-                        "SELECT COUNT(*) FROM media WHERE status NOT IN ('complete','deferred','unavailable')",
-                        [],
-                        |r| r.get(0),
-                    )?;
+                    let pending = a
+                        .store
+                        .all::<MediaRow>()?
+                        .iter()
+                        .filter(|r| {
+                            !["complete", "deferred", "unavailable"].contains(&r.status.as_str())
+                        })
+                        .count();
                     let paused = a
                         .checkpoint(&format!("pause_reason:{}", self.job))?
                         .is_some_and(|v| !v.is_null());
@@ -1510,10 +1497,7 @@ impl Engine {
                                     integer(&dialog["notify_settings"]["mute_until"]).unwrap_or(0)
                                         > Utc::now().timestamp()
                                 );
-                                a.db.execute(
-                                    "UPDATE peers SET metadata=?2 WHERE key=?1",
-                                    params![key, meta.to_string()],
-                                )?;
+                                a.peer_metadata(&key, &meta)?;
                             }
                             a.set_checkpoint(
                                 &format!("peer_range:{}:{key}:{range_index}", self.job),
@@ -1554,26 +1538,22 @@ impl Engine {
             .is_none_or(|peers| peers.contains(key))
     }
     fn input_peer(&self, key: &str) -> Result<Value> {
-        let s: String = self.archive.lock().unwrap().db.query_row(
-            "SELECT input FROM peers WHERE key=?1",
-            [key],
-            |r| r.get(0),
-        )?;
+        let s = self
+            .archive
+            .lock()
+            .unwrap()
+            .peer(key)?
+            .context("peer not found")?
+            .input;
         Ok(serde_json::from_str(&s)?)
     }
     fn peer_list(&self) -> Result<Vec<(String, Value, Value, Value)>> {
         let a = self.archive.lock().unwrap();
-        let rows =
-            a.db.prepare("SELECT key,input,metadata,raw FROM peers ORDER BY key")?
-                .query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = a
+            .peers()?
+            .into_iter()
+            .map(|r| (r.key, r.input, r.metadata, r.raw))
+            .collect::<Vec<_>>();
         rows.into_iter()
             .map(|(k, i, m, r)| {
                 Ok((
@@ -1587,10 +1567,7 @@ impl Engine {
     }
     fn refresh_folders(&self) -> Result<()> {
         let a = self.archive.lock().unwrap();
-        let filters: Vec<String> =
-            a.db.prepare("SELECT data FROM folders")?
-                .query_map([], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
+        let filters = a.folders()?.into_iter().map(|r| r.data).collect::<Vec<_>>();
         drop(a);
         for (key, _, mut metadata, _) in self.peer_list()? {
             if !self.sync_peer(&key) {
@@ -1604,10 +1581,10 @@ impl Engine {
                 }
             }
             metadata["folder"] = json!(folders);
-            self.archive.lock().unwrap().db.execute(
-                "UPDATE peers SET metadata=?2 WHERE key=?1",
-                params![key, metadata.to_string()],
-            )?;
+            self.archive
+                .lock()
+                .unwrap()
+                .peer_metadata(&key, &metadata)?;
         }
         Ok(())
     }
@@ -1944,17 +1921,16 @@ impl Engine {
             self.check_stop()?;
             if let Some(v) = self.collect(name, args, name).await? {
                 if name == "messages.getDialogFilters" {
-                    let a = self.archive.lock().unwrap();
-                    a.db.execute("DELETE FROM folders", [])?;
-                    for filter in v["filters"].as_array().into_iter().flatten() {
-                        a.db.execute(
-                            "INSERT OR REPLACE INTO folders VALUES(?1,?2)",
-                            params![
-                                integer(&filter["id"]).unwrap_or(0).to_string(),
-                                filter.to_string()
-                            ],
-                        )?;
-                    }
+                    let rows = v["filters"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|r| FolderRow {
+                            id: integer(&r["id"]).unwrap_or(0).to_string(),
+                            data: r.to_string(),
+                        })
+                        .collect::<Vec<_>>();
+                    self.archive.lock().unwrap().set_folders(&rows)?;
                 }
                 if let Some(sets) = v["sets"].as_array() {
                     for set in sets {
@@ -2262,22 +2238,25 @@ impl Engine {
         let mut after = if let Some(v) = a.checkpoint("media_discovery_cursor_v2")? {
             integer(&v).unwrap_or(0)
         } else {
-            let after = a.db.query_row(
-                "SELECT COALESCE(MAX(id),0) FROM observations WHERE kind='media'",
-                [],
-                |r| r.get(0),
-            )?;
+            let after = a
+                .store
+                .select::<ObservationRow>(&Select::eq("kind", "media"))?
+                .iter()
+                .map(|r| r.id)
+                .max()
+                .unwrap_or(0);
             a.set_checkpoint("media_discovery_cursor_v2", &json!(after))?;
             after
         };
         loop {
-            let ids: Vec<i64> = a
-                .db
-                .prepare(
-                    "SELECT id FROM observations WHERE id>?1 AND kind='media' ORDER BY id LIMIT 128",
-                )?
-                .query_map([after], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
+            let mut select = Select::after("id", after, 128);
+            select.filters.push(("kind", "=", json!("media")));
+            let ids = a
+                .store
+                .select::<ObservationRow>(&select)?
+                .into_iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>();
             if ids.is_empty() {
                 break;
             }
@@ -2291,10 +2270,7 @@ impl Engine {
         let mut after = if let Some(v) = a.checkpoint("media_refs_cursor_v2")? {
             integer(&v).unwrap_or(0)
         } else {
-            let after =
-                a.db.query_row("SELECT COALESCE(MAX(id),0) FROM observations", [], |r| {
-                    r.get(0)
-                })?;
+            let after = a.observation_high_water()?;
             a.set_checkpoint("media_refs_cursor_v2", &json!(after))?;
             after
         };
@@ -2315,7 +2291,17 @@ impl Engine {
     /// Keep eligibility fixed for one pass so failed media cannot starve peer traversal.
     fn next_pending_media(&self, eligible_before: i64) -> Result<Option<PendingMedia>> {
         let a = self.archive.lock().unwrap();
-        Ok(a.db.query_row("SELECT id,location,dc,size,offset FROM media WHERE status!='complete' AND status!='unavailable' AND retry_at<=?1 ORDER BY attempts,id LIMIT 1",[eligible_before],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i32>(2)?,r.get::<_,Option<u64>>(3)?,r.get::<_,u64>(4)?))).optional()?)
+        a.next_media(eligible_before)?
+            .map(|r| {
+                Ok((
+                    r.id,
+                    r.location,
+                    i32::try_from(r.dc)?,
+                    r.size.map(u64::try_from).transpose()?,
+                    u64::try_from(r.offset)?,
+                ))
+            })
+            .transpose()
     }
     async fn download_pending(&self) -> Result<()> {
         let eligible_before = Utc::now().timestamp();
@@ -2354,15 +2340,12 @@ impl Engine {
                 self.archive
                     .lock()
                     .unwrap()
-                    .db
-                    .execute("UPDATE media SET status='deferred' WHERE id=?1", [&id])?;
+                    .update_media(&id, |r| r.status = "deferred".into())?;
                 continue;
             }
             let metadata = {
                 let a = self.archive.lock().unwrap();
-                let mut st=a.db.prepare("SELECT o.metadata FROM observations o JOIN media_refs r ON r.observation=o.id WHERE r.media=?1")?;
-                st.query_map([&id], |r| r.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
+                a.media_contexts(&id)?
             };
             let selector =
                 Selector::parse(&self.archive.lock().unwrap().config.attachment_selector)?;
@@ -2395,8 +2378,7 @@ impl Engine {
                 self.archive
                     .lock()
                     .unwrap()
-                    .db
-                    .execute("UPDATE media SET status='deferred' WHERE id=?1", [&id])?;
+                    .update_media(&id, |r| r.status = "deferred".into())?;
                 continue;
             }
             let stage = {
@@ -2476,9 +2458,8 @@ impl Engine {
     async fn refresh_media_reference(&self, id: &str) -> Result<()> {
         let (original_location, contexts) = {
             let a = self.archive.lock().unwrap();
-            let original_location: String =
-                a.db.query_row("SELECT location FROM media WHERE id=?1", [id], |r| r.get(0))?;
-            let contexts = a.db.prepare("SELECT DISTINCT o.metadata FROM observations o JOIN media_refs r ON r.observation=o.id WHERE r.media=?1")?.query_map([id],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let original_location = a.media(id)?.location;
+            let contexts = a.media_contexts(id)?;
             (original_location, contexts)
         };
         for ctx in contexts {
@@ -2536,15 +2517,11 @@ impl Engine {
     /// A successful collector response is not proof that the expired file reference changed.
     fn schedule_refreshed_media(&self, id: &str, original_location: &str) -> Result<bool> {
         let a = self.archive.lock().unwrap();
-        let current_location: String =
-            a.db.query_row("SELECT location FROM media WHERE id=?1", [id], |r| r.get(0))?;
+        let current_location = a.media(id)?.location;
         if current_location == original_location {
             return Ok(false);
         }
-        a.db.execute(
-            "UPDATE media SET retry_at=strftime('%s','now')+5 WHERE id=?1",
-            [id],
-        )?;
+        a.update_media(id, |r| r.retry_at = Utc::now().timestamp() + 5)?;
         Ok(true)
     }
 }
@@ -2585,12 +2562,9 @@ pub fn peer_key(v: &Value) -> Option<String> {
     Some(format!("{prefix}:{}", integer(&v[field])?))
 }
 fn peer_metadata(a: &Archive, key: &str) -> Result<Option<Value>> {
-    a.db.query_row("SELECT metadata FROM peers WHERE key=?1", [key], |r| {
-        r.get::<_, String>(0)
-    })
-    .optional()?
-    .map(|s| Ok(serde_json::from_str(&s)?))
-    .transpose()
+    a.peer(key)?
+        .map(|r| Ok(serde_json::from_str(&r.metadata)?))
+        .transpose()
 }
 fn cache_peer(a: &Archive, v: &Value, self_id: i64) -> Result<()> {
     let Some(id) = integer(&v["id"]) else {
@@ -2646,7 +2620,12 @@ fn cache_peer(a: &Archive, v: &Value, self_id: i64) -> Result<()> {
     if v["min"] == true && peer_metadata(a, &key)?.is_some() {
         return Ok(());
     }
-    a.db.execute("INSERT INTO peers VALUES(?1,?2,?3,?4) ON CONFLICT(key) DO UPDATE SET input=excluded.input,metadata=excluded.metadata,raw=excluded.raw",params![key,input.to_string(),metadata.to_string(),v.to_string()])?;
+    a.store.put(&PeerRow {
+        key,
+        input: input.to_string(),
+        metadata: metadata.to_string(),
+        raw: v.to_string(),
+    })?;
     Ok(())
 }
 fn identity(root: &str, v: &Value, scope: &str) -> Option<(String, String)> {
@@ -2759,8 +2738,11 @@ fn deletion_records(
     if constructor == "updateDeleteQuickReply" {
         let shortcut = integer(&v["shortcut_id"]).context("deleted shortcut ID")?;
         let prefix = format!("account/quick_reply:{shortcut}/message:");
-        let mut targets: Vec<(String, String)> = a.db.prepare("SELECT h.key,o.kind FROM heads h JOIN observations o ON o.id=h.observation WHERE o.kind='quick_reply_message' AND substr(h.key,1,length(?1))=?1")?
-            .query_map([prefix], |r| Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        let mut targets = a
+            .current_observations("quick_reply_message", Some(&prefix))?
+            .into_iter()
+            .map(|r| (r.key, r.kind))
+            .collect::<Vec<_>>();
         targets.push(
             extra::object_identity(
                 "QuickReply",
@@ -2808,11 +2790,14 @@ fn deletion_records(
         } else if let Some(channel) = integer(&v["channel_id"]) {
             Some(format!("channel:{channel}/message:{id}"))
         } else {
-            let keys: Vec<String> = a
-                .db
-                .prepare("SELECT h.key FROM heads h JOIN observations o ON o.id=h.observation WHERE o.kind='message' AND h.key LIKE ?1 AND h.key NOT LIKE 'channel:%'")?
-                .query_map([format!("%/message:{id}")], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
+            let keys = a
+                .current_observations("message", None)?
+                .into_iter()
+                .filter(|r| {
+                    !r.key.starts_with("channel:") && r.key.ends_with(&format!("/message:{id}"))
+                })
+                .map(|r| r.key)
+                .collect::<Vec<_>>();
             if keys.len() == 1 {
                 Some(keys[0].clone())
             } else {
@@ -2939,7 +2924,9 @@ mod tests {
         let first = prepare_sync_job(&mut archive, &mut SyncOptions::default()).unwrap();
         for status in ["running", "paused", "failed"] {
             archive
-                .db
+                .store
+                .sqlite()
+                .unwrap()
                 .execute("UPDATE jobs SET status=?1", [status])
                 .unwrap();
             let mut options = SyncOptions::default();
@@ -2957,7 +2944,9 @@ mod tests {
         assert_ne!(first, second);
         // Force a tie in timestamps: the most recently inserted job wins.
         archive
-            .db
+            .store
+            .sqlite()
+            .unwrap()
             .execute("UPDATE jobs SET updated=1,created=1", [])
             .unwrap();
         assert_eq!(
@@ -2966,7 +2955,9 @@ mod tests {
         );
         for status in ["complete", "complete_with_gaps", "aborted"] {
             archive
-                .db
+                .store
+                .sqlite()
+                .unwrap()
                 .execute("UPDATE jobs SET status=?1", [status])
                 .unwrap();
             let mut options = SyncOptions::default();
@@ -3065,7 +3056,9 @@ mod tests {
             (Some(4), None, Some(5))
         );
         let saved: String = archive
-            .db
+            .store
+            .sqlite()
+            .unwrap()
             .query_row("SELECT config FROM jobs WHERE id=?1", [&first], |r| {
                 r.get(0)
             })
@@ -3132,7 +3125,7 @@ mod tests {
 
     pub(super) async fn fixture(root: &Path, config: Config) -> Engine {
         let a = Archive::init(root, &config).unwrap();
-        a.db.execute_batch("CREATE TABLE peers(key TEXT PRIMARY KEY,input TEXT,metadata TEXT,raw TEXT); CREATE TABLE folders(id TEXT PRIMARY KEY,data TEXT);").unwrap();
+        a.store.ensure_peers().unwrap();
         a.set_checkpoint("account_id", &json!(1)).unwrap();
         cache_peer(
             &a,
@@ -3187,7 +3180,9 @@ mod tests {
         e.archive
             .lock()
             .unwrap()
-            .db
+            .store
+            .sqlite()
+            .unwrap()
             .execute(
                 "INSERT INTO jobs VALUES('fixture','{}','running',0,0,'{}')",
                 [],
@@ -3195,8 +3190,11 @@ mod tests {
             .unwrap();
         let details = || -> Value {
             let a = e.archive.lock().unwrap();
-            let text: String =
-                a.db.query_row("SELECT details FROM jobs WHERE id='fixture'", [], |r| {
+            let text: String = a
+                .store
+                .sqlite()
+                .unwrap()
+                .query_row("SELECT details FROM jobs WHERE id='fixture'", [], |r| {
                     r.get(0)
                 })
                 .unwrap();
@@ -3232,6 +3230,74 @@ mod tests {
         assert_eq!(details()["peers_discovered"], 2);
     }
 
+    #[tokio::test]
+    async fn clickhouse_sync_capture_and_resume() {
+        let Ok(url) = std::env::var("TG_BACKUP_CLICKHOUSE_URL") else {
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let options = crate::config::ClickHouse {
+            url,
+            database: format!("test_{}", uuid::Uuid::new_v4().simple()),
+            ..Default::default()
+        };
+        let mut e = fixture(
+            root.path(),
+            Config {
+                backend: crate::config::Backend::Clickhouse,
+                clickhouse: Some(options.clone()),
+                ..Default::default()
+            },
+        )
+        .await;
+        e.job =
+            prepare_sync_job(&mut e.archive.lock().unwrap(), &mut SyncOptions::default()).unwrap();
+        let bytes = e.schema.encode("Message", &message()).unwrap();
+        e.capture(
+            "Message",
+            &bytes,
+            "messages.getHistory",
+            Some("user:42"),
+            Some("replay"),
+            Some(("history:42", &json!({"offset":17}))),
+        )
+        .unwrap();
+        e.capture(
+            "Message",
+            &bytes,
+            "messages.getHistory",
+            Some("user:42"),
+            Some("replay"),
+            None,
+        )
+        .unwrap();
+        e.progress("history", 1, Some(1)).unwrap();
+        let mut a = e.archive.lock().unwrap();
+        assert_eq!(
+            a.query(&Query {
+                kind: Some("message".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .records
+            .len(),
+            1
+        );
+        assert_eq!(
+            a.checkpoint("history:42").unwrap(),
+            Some(json!({"offset":17}))
+        );
+        assert_eq!(a.store.count::<MediaRow>(&Select::default()).unwrap(), 1);
+        let mut sync = SyncOptions::default();
+        assert_eq!(prepare_sync_job(&mut a, &mut sync).unwrap(), e.job);
+        drop(a);
+        drop(e);
+        crate::storage::ClickHouseStore::connect(&options, true)
+            .unwrap()
+            .execute(format!("DROP DATABASE {}", options.database))
+            .unwrap();
+    }
+
     pub(super) fn message() -> Value {
         json!({"_":"message","id":17,"peer_id":{"_":"peerUser","user_id":"42"},"date":1700000000,"message":"private text","media":{"_":"messageMediaPhoto","photo":{"_":"photo","id":"123","access_hash":"456","file_reference":{"$bytes":"abcd"},"date":1700000000,"sizes":[{"_":"photoSize","type":"x","w":100,"h":100,"size":4}],"dc_id":2}}})
     }
@@ -3246,11 +3312,14 @@ mod tests {
         .await;
         {
             let a = e.archive.lock().unwrap();
-            a.db.execute(
-                "INSERT INTO jobs VALUES('fixture','{}','running',0,0,'{}')",
-                [],
-            )
-            .unwrap();
+            a.store
+                .sqlite()
+                .unwrap()
+                .execute(
+                    "INSERT INTO jobs VALUES('fixture','{}','running',0,0,'{}')",
+                    [],
+                )
+                .unwrap();
             cache_peer(
                 &a,
                 &json!({"_":"user","id":"43","access_hash":"124","first_name":"Other"}),
@@ -3303,8 +3372,11 @@ mod tests {
         }
         if download {
             let a = e.archive.lock().unwrap();
-            let (location, offset): (String, u64) =
-                a.db.query_row(
+            let (location, offset): (String, u64) = a
+                .store
+                .sqlite()
+                .unwrap()
+                .query_row(
                     "SELECT location,offset FROM media WHERE id='photo:123:x'",
                     [],
                     |r| Ok((r.get(0)?, r.get(1)?)),
@@ -3363,14 +3435,20 @@ mod tests {
         );
         assert!(a.checkpoint("history_success:user:42").unwrap().is_some());
         assert!(a.checkpoint("history_success:user:43").unwrap().is_some());
-        let status: String =
-            a.db.query_row("SELECT status FROM media WHERE id='photo:124:x'", [], |r| {
+        let status: String = a
+            .store
+            .sqlite()
+            .unwrap()
+            .query_row("SELECT status FROM media WHERE id='photo:124:x'", [], |r| {
                 r.get(0)
             })
             .unwrap();
         assert_eq!(status, "deferred");
-        let status: String =
-            a.db.query_row("SELECT status FROM media WHERE id='photo:123:x'", [], |r| {
+        let status: String = a
+            .store
+            .sqlite()
+            .unwrap()
+            .query_row("SELECT status FROM media WHERE id='photo:123:x'", [], |r| {
                 r.get(0)
             })
             .unwrap();
@@ -3413,15 +3491,21 @@ mod tests {
             e.run().await.unwrap();
             assert!(e.mock_rpc.as_ref().unwrap().lock().unwrap().is_empty());
             let a = e.archive.lock().unwrap();
-            let status: String =
-                a.db.query_row("SELECT status FROM media WHERE id='photo:123:x'", [], |r| {
+            let status: String = a
+                .store
+                .sqlite()
+                .unwrap()
+                .query_row("SELECT status FROM media WHERE id='photo:123:x'", [], |r| {
                     r.get(0)
                 })
                 .unwrap();
             assert_eq!(status, "complete");
             if fail_first {
-                let coverage: String =
-                    a.db.query_row(
+                let coverage: String = a
+                    .store
+                    .sqlite()
+                    .unwrap()
+                    .query_row(
                         "SELECT status FROM coverage WHERE name='history:user:42'",
                         [],
                         |r| r.get(0),
@@ -3447,8 +3531,11 @@ mod tests {
             assert_eq!(result.is_err(), cancel);
             assert!(e.mock_rpc.as_ref().unwrap().lock().unwrap().is_empty());
             let a = e.archive.lock().unwrap();
-            let offset: u64 =
-                a.db.query_row("SELECT offset FROM media WHERE id='photo:123:x'", [], |r| {
+            let offset: u64 = a
+                .store
+                .sqlite()
+                .unwrap()
+                .query_row("SELECT offset FROM media WHERE id='photo:123:x'", [], |r| {
                     r.get(0)
                 })
                 .unwrap();
@@ -3520,7 +3607,10 @@ mod tests {
         assert!(records.iter().any(|r| r.metadata["outgoing"] == true));
         assert!(records.iter().any(|r| r.metadata["category"] == "personal"));
         assert_eq!(
-            a.db.query_row("SELECT COUNT(*) FROM media", [], |r| r.get::<_, i64>(0))
+            a.store
+                .sqlite()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM media", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
             2
         );
@@ -3573,7 +3663,10 @@ mod tests {
         assert_eq!(records[0].metadata["message_id"], 17);
         assert_eq!(a.checkpoint("telegram_updates").unwrap().unwrap()["pts"], 1);
         assert_eq!(
-            a.db.query_row("SELECT COUNT(*) FROM media", [], |r| r.get::<_, i64>(0))
+            a.store
+                .sqlite()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM media", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
             1
         );
@@ -3647,7 +3740,9 @@ mod tests {
         e.archive
             .lock()
             .unwrap()
-            .db
+            .store
+            .sqlite()
+            .unwrap()
             .execute(
                 "INSERT INTO jobs VALUES('fixture','{}','running',0,0,'{}')",
                 [],
@@ -3663,7 +3758,7 @@ mod tests {
         )
         .unwrap();
         let retry_at = Utc::now().timestamp() + 300;
-        let contexts: Vec<String> = e.archive.lock().unwrap().db.prepare(
+        let contexts: Vec<String> = e.archive.lock().unwrap().store.sqlite().unwrap().prepare(
             "SELECT o.metadata FROM observations o JOIN media_refs r ON r.observation=o.id WHERE r.media='photo:123:x'"
         ).unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
         assert!(
@@ -3694,19 +3789,25 @@ mod tests {
             "refresh must issue an RPC"
         );
         let a = e.archive.lock().unwrap();
-        let coverage: Vec<String> =
-            a.db.prepare("SELECT details FROM coverage")
-                .unwrap()
-                .query_map([], |r| r.get(0))
-                .unwrap()
-                .map(Result::unwrap)
-                .collect();
+        let coverage: Vec<String> = a
+            .store
+            .sqlite()
+            .unwrap()
+            .prepare("SELECT details FROM coverage")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
         assert!(
             coverage.iter().all(|c| !c.contains("error")),
             "refresh failed: {coverage:?}"
         );
-        let actual: i64 =
-            a.db.query_row(
+        let actual: i64 = a
+            .store
+            .sqlite()
+            .unwrap()
+            .query_row(
                 "SELECT retry_at FROM media WHERE id='photo:123:x'",
                 [],
                 |r| r.get(0),
@@ -3716,8 +3817,11 @@ mod tests {
             actual, retry_at,
             "a stale reference must not be retried in five seconds"
         );
-        let original_location: String =
-            a.db.query_row(
+        let original_location: String = a
+            .store
+            .sqlite()
+            .unwrap()
+            .query_row(
                 "SELECT location FROM media WHERE id='photo:123:x'",
                 [],
                 |r| r.get(0),
@@ -3725,11 +3829,14 @@ mod tests {
             .unwrap();
         let mut refreshed: Value = serde_json::from_str(&original_location).unwrap();
         refreshed["file_reference"] = json!({"$bytes":"ef01"});
-        a.db.execute(
-            "UPDATE media SET location=?1 WHERE id='photo:123:x'",
-            [refreshed.to_string()],
-        )
-        .unwrap();
+        a.store
+            .sqlite()
+            .unwrap()
+            .execute(
+                "UPDATE media SET location=?1 WHERE id='photo:123:x'",
+                [refreshed.to_string()],
+            )
+            .unwrap();
         drop(a);
         assert!(
             e.schedule_refreshed_media("photo:123:x", &original_location)
@@ -3739,7 +3846,9 @@ mod tests {
             .archive
             .lock()
             .unwrap()
-            .db
+            .store
+            .sqlite()
+            .unwrap()
             .query_row(
                 "SELECT retry_at FROM media WHERE id='photo:123:x'",
                 [],
@@ -3754,11 +3863,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let e = fixture(dir.path(), Config::default()).await;
         let a = e.archive.lock().unwrap();
-        a.db.execute(
-            "INSERT INTO media(id,location,dc,retry_at) VALUES('stale','{}',2,100)",
-            [],
-        )
-        .unwrap();
+        a.store
+            .sqlite()
+            .unwrap()
+            .execute(
+                "INSERT INTO media(id,location,dc,retry_at) VALUES('stale','{}',2,100)",
+                [],
+            )
+            .unwrap();
         drop(a);
         assert!(e.next_pending_media(99).unwrap().is_none());
         assert_eq!(e.next_pending_media(100).unwrap().unwrap().0, "stale");
@@ -3779,9 +3891,12 @@ mod tests {
         .unwrap();
         e.reconcile_media().unwrap();
         let a = e.archive.lock().unwrap();
-        let last: i64 =
-            a.db.query_row("SELECT MAX(id) FROM observations", [], |r| r.get(0))
-                .unwrap();
+        let last: i64 = a
+            .store
+            .sqlite()
+            .unwrap()
+            .query_row("SELECT MAX(id) FROM observations", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(
             a.checkpoint("media_refs_cursor_v2").unwrap(),
             Some(json!(last))
@@ -3826,7 +3941,10 @@ mod tests {
         e.download_pending().await.unwrap();
         let a = e.archive.lock().unwrap();
         assert_eq!(
-            a.db.query_row("SELECT status FROM media", [], |r| r.get::<_, String>(0))
+            a.store
+                .sqlite()
+                .unwrap()
+                .query_row("SELECT status FROM media", [], |r| r.get::<_, String>(0))
                 .unwrap(),
             "complete"
         );

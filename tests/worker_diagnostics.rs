@@ -20,11 +20,14 @@ fn script(path: &std::path::Path, text: &str) {
 fn fixture(bytes: &[u8]) -> (tempfile::TempDir, Archive, Task) {
     let dir = tempfile::tempdir_in("/tmp").unwrap();
     let a = Archive::init(dir.path(), &Config::default()).unwrap();
-    a.db.execute(
-        "INSERT INTO media(id,location,dc,size) VALUES('document:1','{}',2,?1)",
-        [bytes.len()],
-    )
-    .unwrap();
+    a.store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "INSERT INTO media(id,location,dc,size) VALUES('document:1','{}',2,?1)",
+            [bytes.len()],
+        )
+        .unwrap();
     a.append_media("document:1", 0, bytes).unwrap();
     let hash = a.finish_media("document:1").unwrap();
     let config =
@@ -64,7 +67,10 @@ fn unsupported_old_task_skips_before_probe_and_original_survives() {
             bytes
         );
         assert_eq!(
-            a.db.query_row("SELECT status FROM media", [], |r| r.get::<_, String>(0))
+            a.store
+                .sqlite()
+                .unwrap()
+                .query_row("SELECT status FROM media", [], |r| r.get::<_, String>(0))
                 .unwrap(),
             "complete"
         );
@@ -123,7 +129,11 @@ fn stderr_crosses_process_socket_and_catalog_without_deadlock() {
         drop(a);
         // Three preexisting attempts ensure one execution records a terminal error.
         let a = Archive::open(dir.path(), true).unwrap();
-        a.db.execute("UPDATE work SET attempts=2", []).unwrap();
+        a.store
+            .sqlite()
+            .unwrap()
+            .execute("UPDATE work SET attempts=2", [])
+            .unwrap();
         drop(a);
         let output = Command::new(env!("CARGO_BIN_EXE_tg-backup"))
             .arg("--dataset")

@@ -200,7 +200,10 @@ fn private_direction_exclusions_missing_identity_and_escaping() {
     assert!(html.contains("\\u003c/script"));
     drop(a);
     let a = Archive::open(dir.path(), true).unwrap();
-    a.db.execute("DELETE FROM checkpoints WHERE key='account_id'", [])
+    a.store
+        .sqlite()
+        .unwrap()
+        .execute("DELETE FROM checkpoints WHERE key='account_id'", [])
         .unwrap();
     drop(a);
     let a = Archive::open(dir.path(), false).unwrap();

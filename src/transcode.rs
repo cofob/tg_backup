@@ -4,7 +4,7 @@ use crate::{
     work::{Resources, Task},
 };
 use anyhow::{Context, Result, ensure};
-use rusqlite::params;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -81,11 +81,9 @@ fn content_date(value: &Value) -> Option<i64> {
 fn references_allow(a: &Archive, hash: &str, p: &Policy) -> Result<bool> {
     let selector = crate::selector::Selector::parse(&p.selector)?;
     let cutoff = chrono::Utc::now().timestamp() - i64::from(p.min_age_days) * 86400;
-    let mut st=a.db.prepare("SELECT DISTINCT r.observation FROM media_refs r JOIN media m ON r.media=m.id WHERE m.hash=?1")?;
-    let mut rows = st.query([hash])?;
     let mut any = false;
-    while let Some(row) = rows.next()? {
-        let record = a.record(row.get(0)?)?;
+    for (_, observation) in a.media_observations(hash)? {
+        let record = a.record(observation)?;
         if !selector.matches(&record.metadata)
             || (p.min_age_days > 0 && content_date(&record.data).is_none_or(|t| t > cutoff))
         {
@@ -112,7 +110,7 @@ pub fn enqueue(a: &Archive, p: &Policy, apply: bool, automatic: bool) -> Result<
     };
     let mut eligible = 0;
     loop {
-        let hashes:Vec<String>=a.db.prepare("SELECT DISTINCT hash FROM media WHERE status='complete' AND hash>?1 AND hash NOT IN(SELECT hash FROM representations) ORDER BY hash LIMIT 32")?.query_map([&last],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let hashes = a.transcode_candidates(&last)?;
         if hashes.is_empty() {
             if automatic && apply {
                 a.set_checkpoint(&scan_key, &json!(""))?;
@@ -506,17 +504,14 @@ pub fn publish(a: &mut Archive, task: &Task, report: &Value) -> Result<()> {
         crate::archive::sync_dir(dest.parent().unwrap())?;
     }
     let policy: Policy = serde_json::from_value(task.config["policy"].clone())?;
-    a.db.execute(
-        "INSERT OR REPLACE INTO representations VALUES(?1,?2,?3,?4,?5,?6)",
-        params![
-            original,
-            hash,
-            task.config["recipe"].as_str(),
-            report["bytes"].as_u64(),
-            chrono::Utc::now().timestamp_micros(),
-            report.to_string()
-        ],
-    )?;
+    a.store.put(&crate::storage::rows::RepresentationRow {
+        original: original.into(),
+        hash: hash.into(),
+        recipe: task.config["recipe"].as_str().context("recipe")?.into(),
+        bytes: report["bytes"].as_i64().context("output bytes")?,
+        created: chrono::Utc::now().timestamp_micros(),
+        details: report.to_string(),
+    })?;
     // Original replacement requires all current references and the reader lock. Busy readers defer deletion.
     if policy.replace_originals && references_allow(a, original, &policy)? {
         let readers = std::fs::OpenOptions::new()
@@ -524,13 +519,24 @@ pub fn publish(a: &mut Archive, task: &Task, report: &Value) -> Result<()> {
             .write(true)
             .open(a.root.join("readers.lock"))?;
         if fs2::FileExt::try_lock_exclusive(&readers).is_ok() {
-            let tx = a.db.transaction()?;
-            tx.execute("INSERT INTO media_transformations(at,original,replacement,policy,details) VALUES(?1,?2,?3,?4,?5)",params![chrono::Utc::now().timestamp_micros(),original,hash,serde_json::to_string(&policy)?,report.to_string()])?;
-            tx.execute(
-                "UPDATE media SET hash=?2,offset=?3 WHERE hash=?1",
-                params![original, hash, report["bytes"].as_u64()],
-            )?;
-            tx.commit()?;
+            use crate::storage::{CATALOG, Select, rows::*};
+            let mut changes = vec![Change::put(
+                CATALOG,
+                &TransformationRow {
+                    id: a.store.next_id::<TransformationRow>("id")?,
+                    at: chrono::Utc::now().timestamp_micros(),
+                    original: original.into(),
+                    replacement: hash.into(),
+                    policy: serde_json::to_string(&policy)?,
+                    details: report.to_string(),
+                },
+            )?];
+            for mut row in a.store.select::<MediaRow>(&Select::eq("hash", original))? {
+                row.hash = Some(hash.into());
+                row.offset = report["bytes"].as_i64().context("output bytes")?;
+                changes.push(Change::put(CATALOG, &row)?);
+            }
+            a.store.batch(changes)?;
             std::fs::remove_file(crate::media::attachment_path(&a.root, original)?)?;
         }
     }

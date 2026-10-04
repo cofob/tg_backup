@@ -144,11 +144,7 @@ async fn attachment(
     let lookup = hash.clone();
     let file = tokio::task::spawn_blocking(move || {
         let a = Archive::open(&root, false)?;
-        let exists: bool = a.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM media WHERE hash=?1 AND status='complete' UNION SELECT 1 FROM representations WHERE hash=?1)",
-            [&lookup],
-            |r| r.get(0),
-        )?;
+        let exists = a.has_attachment(&lookup)?;
         ensure!(exists, "attachment not found");
         Ok::<_, anyhow::Error>(std::fs::File::open(crate::media::attachment_path(
             &root, &lookup,

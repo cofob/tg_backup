@@ -288,12 +288,10 @@ pub fn build(archive: &Archive, options: &Options) -> Result<Graph> {
         b.node(id);
     }
     let mut senders = HashMap::new();
-    let mut statement = archive
-        .db
-        .prepare("SELECT observation FROM heads ORDER BY observation")?;
+    let ids = archive.head_ids()?;
     // First pass resolves identities and reply authors regardless of the selected date range.
-    for id in statement.query_map([], |r| r.get::<_, i64>(0))? {
-        let r = archive.record(id?)?;
+    for id in &ids {
+        let r = archive.record(*id)?;
         if r.deleted {
             continue;
         }
@@ -332,8 +330,8 @@ pub fn build(archive: &Archive, options: &Options) -> Result<Graph> {
         }
     }
     let mut member_days = BTreeSet::new();
-    for id in statement.query_map([], |r| r.get::<_, i64>(0))? {
-        let r = archive.record(id?)?;
+    for id in &ids {
+        let r = archive.record(*id)?;
         if r.deleted {
             continue;
         }

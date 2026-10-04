@@ -6,6 +6,10 @@ use std::{
 };
 #[derive(clap::Args)]
 pub struct Options {
+    #[arg(long, value_enum, default_value = "sqlite")]
+    pub backend: crate::config::Backend,
+    #[command(flatten)]
+    pub connection: crate::migration::ConnectionOptions,
     /// Use private token files without probing system secure storage.
     #[arg(long)]
     pub no_secure_storage: bool,
@@ -37,10 +41,10 @@ fn yes(label: &str, default: bool) -> Result<bool> {
 }
 pub async fn run(root: &Path, o: Options) -> Result<()> {
     ensure!(
-        !root.join("catalog.sqlite3").exists(),
+        !root.join("config.toml").exists(),
         "dataset exists; edit its config or use auth to resume login"
     );
-    let mut c = Config::default();
+    let mut c = o.connection.config(o.backend, Config::default())?;
     if !o.non_interactive {
         ensure!(
             std::io::stdin().is_terminal(),

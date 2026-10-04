@@ -1,7 +1,7 @@
 //! Read-only projection of cached peers and per-peer getHistory coverage.
 use crate::archive::Archive;
+use crate::storage::{Select, rows::*};
 use anyhow::{Result, ensure};
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -158,44 +158,47 @@ impl Archive {
             options.after.as_ref().is_none_or(|s| s.len() <= 256),
             "cursor too long"
         );
-        let has_peers: bool = self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='peers')",
-            [],
-            |row| row.get(0),
-        )?;
-        if !has_peers {
-            return Ok(Page {
-                items: vec![],
-                next_cursor: None,
-            });
-        }
         let mut items = Vec::new();
         let mut after = options.after.clone().unwrap_or_default();
         loop {
-            let mut statement = self.db.prepare(
-                "SELECT p.key,p.raw,p.metadata,h.status,h.details,s.value,a.details FROM peers p
-                 LEFT JOIN coverage h ON h.name='history:'||p.key
-                 LEFT JOIN checkpoints s ON s.key='history_success:'||p.key
-                 LEFT JOIN coverage a ON a.name='access:'||p.key AND a.status='limited'
-                 WHERE p.key>?1
-                   AND EXISTS (SELECT 1 FROM observations d
-                               WHERE d.key=p.key||'/dialog' AND d.kind='dialog' AND d.deleted=0)
-                 ORDER BY p.key LIMIT 256",
-            )?;
-            let rows = statement
-                .query_map(params![after], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let count = rows.len();
+            let mut rows = Vec::new();
+            let mut select = Select::eq("key", after.clone()).with_operator(">");
+            select.order = Some("key");
+            select.limit = Some(256);
+            let peers = self.store.select::<PeerRow>(&select)?;
+            let count = peers.len();
+            for peer in peers {
+                after = peer.key.clone();
+                let mut dialog = Select::eq("key", format!("{}/dialog", peer.key));
+                dialog.filters.extend([
+                    ("kind", "=", serde_json::json!("dialog")),
+                    ("deleted", "=", serde_json::json!(0)),
+                ]);
+                if self.store.count::<ObservationRow>(&dialog)? == 0 {
+                    continue;
+                }
+                let coverage = self
+                    .store
+                    .get::<CoverageRow>("name", format!("history:{}", peer.key))?;
+                let access = self
+                    .store
+                    .get::<CoverageRow>("name", format!("access:{}", peer.key))?
+                    .filter(|r| r.status == "limited")
+                    .map(|r| r.details);
+                let successful = self
+                    .store
+                    .get::<CheckpointRow>("key", format!("history_success:{}", peer.key))?
+                    .map(|r| r.value);
+                rows.push((
+                    peer.key,
+                    peer.raw,
+                    peer.metadata,
+                    coverage.as_ref().map(|r| r.status.clone()),
+                    coverage.map(|r| r.details),
+                    successful,
+                    access,
+                ));
+            }
             for (key, raw, metadata, status, details, successful, access) in rows {
                 after = key.clone();
                 let item = project(key, &raw, &metadata, status, details, successful, access)?;

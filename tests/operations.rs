@@ -293,8 +293,11 @@ fn real_webp_transcode_keeps_original_and_survives_maintenance() {
     let original = a.finish_media("photo:1:x").unwrap();
     let p = tg_backup::transcode::Policy::default();
     tg_backup::transcode::enqueue(&a, &p, true, false).unwrap();
-    let (sequence, config): (i64, String) =
-        a.db.query_row("SELECT sequence,config FROM work", [], |r| {
+    let (sequence, config): (i64, String) = a
+        .store
+        .sqlite()
+        .unwrap()
+        .query_row("SELECT sequence,config FROM work", [], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })
         .unwrap();

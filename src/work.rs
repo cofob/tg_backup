@@ -1,8 +1,11 @@
 //! Durable expensive-work queue. Only the coordinator writes the archive catalog.
-use crate::archive::Archive;
+use crate::{
+    archive::Archive,
+    storage::{Select, rows::*},
+};
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Datelike, Local, Timelike, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -153,12 +156,24 @@ impl Archive {
             .contains(&kind),
             "unknown work kind"
         );
-        self.db.execute("INSERT OR IGNORE INTO work(kind,dedupe,config,automatic,created,updated) VALUES(?1,?2,?3,?4,?5,?5)",params![kind,dedupe,config.to_string(),automatic,Utc::now().timestamp_micros()])?;
-        Ok(self
-            .db
-            .query_row("SELECT sequence FROM work WHERE dedupe=?1", [dedupe], |r| {
-                r.get(0)
-            })?)
+        if let Some(row) = self.store.get::<WorkRow>("dedupe", dedupe)? {
+            return Ok(row.sequence);
+        }
+        let now = Utc::now().timestamp_micros();
+        let row = WorkRow {
+            sequence: self.store.next_id::<WorkRow>("sequence")?,
+            kind: kind.into(),
+            dedupe: dedupe.into(),
+            config: config.to_string(),
+            automatic: i64::from(automatic),
+            state: "queued".into(),
+            created: now,
+            updated: now,
+            progress: "{}".into(),
+            ..Default::default()
+        };
+        self.store.put(&row)?;
+        Ok(row.sequence)
     }
     pub fn work_page(&self, after: i64, limit: usize) -> Result<Value> {
         self.work_page_filtered(after, limit, false)
@@ -168,23 +183,13 @@ impl Archive {
             after >= 0 && (1..=200).contains(&limit),
             "invalid queue page"
         );
-        let exists: bool = self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='work')",
-            [],
-            |r| r.get(0),
-        )?;
-        if !exists {
-            return Ok(json!({"items":[],"counts":{},"next_cursor":null}));
+        let counts = self.store.states::<WorkRow>("state")?;
+        let mut select = Select::after("sequence", after, limit + 1);
+        if active {
+            select.limit = None;
         }
-        let counts: std::collections::BTreeMap<String, i64> = self
-            .db
-            .prepare("SELECT state,COUNT(*) FROM work GROUP BY state")?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-        let items: Vec<Value>=self.db.prepare("SELECT sequence,kind,state,automatic,created,updated,retry_at,attempts,progress,error FROM work WHERE sequence>?1 AND (?3=0 OR state IN ('queued','running','failed','paused')) ORDER BY sequence LIMIT ?2")?.query_map(params![after,limit+1,active],|r| {
-            let p: String=r.get(8)?;
-            Ok(json!({"sequence":r.get::<_,i64>(0)?,"kind":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"automatic":r.get::<_,bool>(3)?,"created":r.get::<_,i64>(4)?,"updated":r.get::<_,i64>(5)?,"retry_at":r.get::<_,i64>(6)?,"attempts":r.get::<_,i64>(7)?,"progress":serde_json::from_str::<Value>(&p).unwrap_or(Value::Null),"error":r.get::<_,Option<String>>(9)?}))
-        })?.collect::<rusqlite::Result<_>>()?;
+        let rows = self.store.select::<WorkRow>(&select)?;
+        let items = rows.into_iter().filter(|r| !active || ["queued","running","failed","paused"].contains(&r.state.as_str())).take(limit + 1).map(|r| json!({"sequence":r.sequence,"kind":r.kind,"state":r.state,"automatic":r.automatic != 0,"created":r.created,"updated":r.updated,"retry_at":r.retry_at,"attempts":r.attempts,"progress":serde_json::from_str::<Value>(&r.progress).unwrap_or(Value::Null),"error":r.error})).collect::<Vec<_>>();
         let more = items.len() > limit;
         let now = Utc::now();
         let items: Vec<_> = items
@@ -236,23 +241,42 @@ impl Archive {
     }
     pub fn resume_work(&self, id: i64) -> Result<()> {
         ensure!(self.writable, "read-only archive");
-        ensure!(self.db.execute("UPDATE work SET state='queued',retry_at=0,attempts=0,error=NULL,progress='{}',updated=?2 WHERE sequence=?1 AND state IN ('failed','skipped','paused')",params![id,Utc::now().timestamp_micros()])?==1,"work is unknown or not resumable");
-        Ok(())
+        let row = self.work_row(id)?;
+        ensure!(
+            ["failed", "skipped", "paused"].contains(&row.state.as_str()),
+            "work is unknown or not resumable"
+        );
+        self.update_work(id, |r| {
+            r.state = "queued".into();
+            r.retry_at = 0;
+            r.attempts = 0;
+            r.error = None;
+            r.progress = "{}".into();
+            r.updated = Utc::now().timestamp_micros();
+        })
     }
     fn claim_work(&self) -> Result<Option<Task>> {
         let now = Utc::now();
         let allowed = self.config.schedule.allows(now);
-        let task=self.db.query_row("SELECT sequence,kind,config FROM work WHERE state='queued' AND retry_at<=?1 AND (automatic=0 OR ?2) ORDER BY automatic,sequence LIMIT 1",params![now.timestamp_micros(),allowed],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()?;
-        if let Some((sequence, kind, config)) = task {
-            self.db.execute("UPDATE work SET state='running',updated=?2,attempts=attempts+1,error=NULL WHERE sequence=?1",params![sequence,now.timestamp_micros()])?;
-            Ok(Some(Task {
-                sequence,
-                kind,
-                config: serde_json::from_str(&config)?,
-            }))
-        } else {
-            Ok(None)
-        }
+        let mut rows = self
+            .store
+            .select::<WorkRow>(&Select::eq("state", "queued"))?;
+        rows.retain(|r| r.retry_at <= now.timestamp_micros() && (r.automatic == 0 || allowed));
+        rows.sort_by_key(|r| (r.automatic, r.sequence));
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        self.update_work(row.sequence, |r| {
+            r.state = "running".into();
+            r.updated = now.timestamp_micros();
+            r.attempts += 1;
+            r.error = None;
+        })?;
+        Ok(Some(Task {
+            sequence: row.sequence,
+            kind: row.kind,
+            config: serde_json::from_str(&row.config)?,
+        }))
     }
     pub fn status(&self) -> Result<Value> {
         self.operational_status(false)
@@ -261,16 +285,14 @@ impl Archive {
         let mut v = if details {
             self.storage_details()?
         } else {
-            let scalar =
-                |sql: &str| -> Result<i64> { Ok(self.db.query_row(sql, [], |r| r.get(0))?) };
-            json!({"format_version":2,"observations":scalar("SELECT COUNT(*) FROM observations")?,"objects":scalar("SELECT COUNT(*) FROM heads")?,"payloads":scalar("SELECT COUNT(*) FROM payloads")?,"media":scalar("SELECT COUNT(*) FROM media")?,"pending_payloads":scalar("SELECT COUNT(*) FROM payloads WHERE journal IS NOT NULL")?,"catalog_bytes":std::fs::metadata(self.root.join("catalog.sqlite3"))?.len(),"storage_details_included":false})
+            self.catalog_status()?
         };
         let now = Utc::now();
         v["observed_at"] = json!(now.to_rfc3339());
         v["work"] = self.work_page_filtered(0, 20, true)?;
-        let jobs:Vec<Value>=self.db.prepare("SELECT id,status,updated,details,created FROM jobs ORDER BY updated DESC LIMIT 20")?.query_map([],|r|{
-            let details:String=r.get(3)?;Ok(json!({"id":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"updated":r.get::<_,i64>(2)?,"details":serde_json::from_str::<Value>(&details).unwrap_or(Value::Null),"created":r.get::<_,i64>(4)?}))
-        })?.collect::<rusqlite::Result<_>>()?;
+        let mut jobs = self.store.all::<JobRow>()?;
+        jobs.sort_by_key(|r| std::cmp::Reverse(r.updated));
+        let jobs = jobs.into_iter().take(20).map(|r| json!({"id":r.id,"status":r.status,"updated":r.updated,"details":serde_json::from_str::<Value>(&r.details).unwrap_or(Value::Null),"created":r.created})).collect::<Vec<_>>();
         v["sync"] = json!(jobs);
         if let Some(jobs) = v["sync"].as_array_mut() {
             for job in jobs {
@@ -294,18 +316,8 @@ impl Archive {
             .checkpoint("telegram_updates")?
             .and_then(|v| v.get("date").cloned())
             .unwrap_or(Value::Null);
-        v["media_states"] = json!(
-            self.db
-                .prepare("SELECT status,COUNT(*) FROM media GROUP BY status")?
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
-                .collect::<rusqlite::Result<std::collections::BTreeMap<_, _>>>()?
-        );
-        v["coverage_states"] = json!(
-            self.db
-                .prepare("SELECT status,COUNT(*) FROM coverage GROUP BY status")?
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
-                .collect::<rusqlite::Result<std::collections::BTreeMap<_, _>>>()?
-        );
+        v["media_states"] = json!(self.store.states::<MediaRow>("status")?);
+        v["coverage_states"] = json!(self.store.states::<CoverageRow>("status")?);
         v["resources"] = serde_json::to_value(&self.config.resources)?;
         v["resources"]["enforcement"] = json!("best_effort");
         if let Some(runtime) = self.checkpoint("worker_runtime")? {
@@ -463,11 +475,7 @@ pub(crate) async fn execute_local(
 }
 pub async fn run(archive: Arc<Mutex<Archive>>, once: bool) -> Result<()> {
     {
-        let a = archive.lock().unwrap();
-        a.db.execute(
-            "UPDATE work SET state='queued',error='interrupted; restarting' WHERE state='running'",
-            [],
-        )?;
+        archive.lock().unwrap().reset_running_work()?;
     }
     let mut enforcement = "best_effort".to_owned();
     let mut last_scan = std::time::Instant::now() - Duration::from_secs(3600);
@@ -492,7 +500,7 @@ pub async fn run(archive: Arc<Mutex<Archive>>, once: bool) -> Result<()> {
                 tokio::select! {
                     result=&mut work => break result,
                     _=tokio::time::sleep(Duration::from_secs(5)) => { let a=archive.lock().unwrap(); heartbeat(&a,"running",&enforcement)?;
-                        if let Ok(progress)=crate::transcode::progress(&root,task.sequence) {a.db.execute("UPDATE work SET progress=?2 WHERE sequence=?1",params![task.sequence,progress.to_string()])?;} }
+                        if let Ok(progress)=crate::transcode::progress(&root,task.sequence) {a.update_work(task.sequence, |r| r.progress = progress.to_string())?;} }
                 }
             };
             let mut a = archive.lock().unwrap();
@@ -503,25 +511,30 @@ pub async fn run(archive: Arc<Mutex<Archive>>, once: bool) -> Result<()> {
                     match publication {
                         Ok(()) => {
                             let state = report["state"].as_str().unwrap_or("complete");
-                            a.db.execute(
-                                "UPDATE work SET state=?2,progress=?3,updated=?4 WHERE sequence=?1",
-                                params![
-                                    task.sequence,
-                                    state,
-                                    report.to_string(),
-                                    Utc::now().timestamp_micros()
-                                ],
-                            )?;
+                            a.update_work(task.sequence, |r| {
+                                r.state = state.into();
+                                r.progress = report.to_string();
+                                r.updated = Utc::now().timestamp_micros();
+                            })?;
                         }
                         Err(e) => {
-                            a.db.execute("UPDATE work SET state='failed',error=?2,updated=?3 WHERE sequence=?1",params![task.sequence,format!("{e:#}"),Utc::now().timestamp_micros()])?;
+                            a.update_work(task.sequence, |r| {
+                                r.state = "failed".into();
+                                r.error = Some(format!("{e:#}"));
+                                r.updated = Utc::now().timestamp_micros();
+                            })?;
                         }
                     }
                     heartbeat(&a, "idle", &mode)?;
                 }
                 Err(e) => {
                     let now = Utc::now().timestamp_micros();
-                    a.db.execute("UPDATE work SET state=CASE WHEN attempts<3 THEN 'queued' ELSE 'failed' END,error=?2,updated=?3,retry_at=?3+60000000*attempts WHERE sequence=?1",params![task.sequence,format!("{e:#}"),now])?;
+                    a.update_work(task.sequence, |r| {
+                        r.state = if r.attempts < 3 { "queued" } else { "failed" }.into();
+                        r.error = Some(format!("{e:#}"));
+                        r.updated = now;
+                        r.retry_at = now + 60_000_000 * r.attempts;
+                    })?;
                 }
             }
         } else if once {
@@ -600,10 +613,10 @@ pub async fn service(root: std::path::PathBuf, socket: std::path::PathBuf) -> Re
 /// Manual invocations bypass time windows, but use exactly the same worker budget.
 pub async fn manual(a: &mut Archive, kind: &str) -> Result<Value> {
     let id = a.enqueue_work(kind, &uuid::Uuid::new_v4().to_string(), &json!({}), false)?;
-    a.db.execute(
-        "UPDATE work SET state='running',attempts=attempts+1 WHERE sequence=?1",
-        [id],
-    )?;
+    a.update_work(id, |r| {
+        r.state = "running".into();
+        r.attempts += 1;
+    })?;
     let task = Task {
         sequence: id,
         kind: kind.into(),
@@ -613,24 +626,25 @@ pub async fn manual(a: &mut Archive, kind: &str) -> Result<Value> {
     match result {
         Ok((report, mode)) => {
             if let Err(e) = crate::transcode::publish(a, &task, &report) {
-                a.db.execute(
-                    "UPDATE work SET state='failed',error=?2 WHERE sequence=?1",
-                    params![id, format!("{e:#}")],
-                )?;
+                a.update_work(id, |r| {
+                    r.state = "failed".into();
+                    r.error = Some(format!("{e:#}"));
+                })?;
                 return Err(e);
             }
-            a.db.execute(
-                "UPDATE work SET state='complete',progress=?2,updated=?3 WHERE sequence=?1",
-                params![id, report.to_string(), Utc::now().timestamp_micros()],
-            )?;
+            a.update_work(id, |r| {
+                r.state = "complete".into();
+                r.progress = report.to_string();
+                r.updated = Utc::now().timestamp_micros();
+            })?;
             heartbeat(a, "offline", &mode)?;
             Ok(report)
         }
         Err(e) => {
-            a.db.execute(
-                "UPDATE work SET state='failed',error=?2 WHERE sequence=?1",
-                params![id, format!("{e:#}")],
-            )?;
+            a.update_work(id, |r| {
+                r.state = "failed".into();
+                r.error = Some(format!("{e:#}"));
+            })?;
             Err(e)
         }
     }

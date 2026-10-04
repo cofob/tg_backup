@@ -23,11 +23,7 @@ fn sticker_document(v: &Value, id: i64) -> bool {
     }
 }
 pub(crate) fn exclusion(a: &Archive, hash: &str) -> Result<Option<&'static str>> {
-    let mut st = a.db.prepare("SELECT DISTINCT m.id,r.observation FROM media m JOIN media_refs r ON r.media=m.id WHERE m.hash=?1")?;
-    for row in st.query_map([hash], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-    })? {
-        let (id, observation) = row?;
+    for (id, observation) in a.media_observations(hash)? {
         if let Some(id) = id.strip_prefix("document:").and_then(|id| id.parse().ok())
             && sticker_document(&a.record(observation)?.data, id)
         {
@@ -410,13 +406,19 @@ mod tests {
                 a.append_media(id, 0, &bytes).unwrap();
                 a.finish_media(id).unwrap();
             }
-            let hash: String =
-                a.db.query_row("SELECT hash FROM media WHERE id='document:12'", [], |r| {
+            let hash: String = a
+                .store
+                .sqlite()
+                .unwrap()
+                .query_row("SELECT hash FROM media WHERE id='document:12'", [], |r| {
                     r.get(0)
                 })
                 .unwrap();
-            let ordinary: String =
-                a.db.query_row("SELECT hash FROM media WHERE id='document:13'", [], |r| {
+            let ordinary: String = a
+                .store
+                .sqlite()
+                .unwrap()
+                .query_row("SELECT hash FROM media WHERE id='document:13'", [], |r| {
                     r.get(0)
                 })
                 .unwrap();
@@ -439,7 +441,10 @@ mod tests {
                 "skipped"
             );
             // Any sticker reference to a shared hash wins over ordinary references.
-            a.db.execute("UPDATE media SET hash=?1 WHERE id='document:13'", [&hash])
+            a.store
+                .sqlite()
+                .unwrap()
+                .execute("UPDATE media SET hash=?1 WHERE id='document:13'", [&hash])
                 .unwrap();
             assert!(exclusion(&a, &hash).unwrap().is_some());
         }

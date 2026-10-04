@@ -177,10 +177,14 @@ impl Engine {
                 continue;
             }
             let scope = format!("extra/{category}");
-            let rows: Vec<(String, String)> =
-                a.db.prepare("SELECT status,details FROM coverage WHERE name LIKE ?1")?
-                    .query_map([format!("{scope}/%")], |r| Ok((r.get(0)?, r.get(1)?)))?
-                    .collect::<rusqlite::Result<_>>()?;
+            let rows = a
+                .store
+                .select::<CoverageRow>(
+                    &Select::eq("name", format!("{scope}/%")).with_operator("LIKE"),
+                )?
+                .into_iter()
+                .map(|r| (r.status, r.details))
+                .collect::<Vec<_>>();
             let mut states = Vec::new();
             for (status, details) in rows {
                 if serde_json::from_str::<Value>(&details)?["job"] == self.job {
@@ -296,8 +300,12 @@ impl Engine {
         let mut a = self.archive.lock().unwrap();
         let prefix = format!("{peer}/scheduled_message:");
         // Do not remove or supersede updates received while the RPC was in flight.
-        let previous: Vec<(String, String)> = a.db.prepare("SELECT h.key,o.metadata FROM heads h JOIN observations o ON o.id=h.observation WHERE o.kind='scheduled_message' AND o.deleted=0 AND o.observed<=?1 AND substr(h.key,1,length(?2))=?2")?
-            .query_map(params![requested_at,prefix], |r| Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        let previous = a
+            .current_observations("scheduled_message", Some(&prefix))?
+            .into_iter()
+            .filter(|r| r.deleted == 0 && r.observed <= requested_at)
+            .map(|r| (r.key, r.metadata))
+            .collect::<Vec<_>>();
         let mut removed = Vec::new();
         for (key, metadata) in previous {
             let mut metadata: Value = serde_json::from_str(&metadata)?;
@@ -861,11 +869,13 @@ impl Engine {
                                 }
                             } else if peer.starts_with("channel:") {
                                 let raw: Value = serde_json::from_str(
-                                    &self.archive.lock().unwrap().db.query_row(
-                                        "SELECT raw FROM peers WHERE key=?1",
-                                        [peer],
-                                        |r| r.get::<_, String>(0),
-                                    )?,
+                                    &self
+                                        .archive
+                                        .lock()
+                                        .unwrap()
+                                        .peer(peer)?
+                                        .context("peer not found")?
+                                        .raw,
                                 )?;
                                 if raw["creator"] == true || raw.get("admin_rights").is_some() {
                                     self.extra_pages(
@@ -1140,7 +1150,9 @@ mod tests {
         e.archive
             .lock()
             .unwrap()
-            .db
+            .store
+            .sqlite()
+            .unwrap()
             .query_row("SELECT status FROM coverage WHERE name=?1", [scope], |r| {
                 r.get(0)
             })
@@ -1272,13 +1284,16 @@ mod tests {
             assert_eq!(records[0].key, key);
             assert_eq!(records[0].deleted, deleted);
         }
-        let contexts: Vec<String> =
-            a.db.prepare("SELECT metadata FROM observations WHERE kind='media'")
-                .unwrap()
-                .query_map([], |r| r.get(0))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap();
+        let contexts: Vec<String> = a
+            .store
+            .sqlite()
+            .unwrap()
+            .prepare("SELECT metadata FROM observations WHERE kind='media'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
         assert!(contexts.iter().any(|s| s.contains("quick_reply_message") && s.contains("quick_reply_shortcut_id")));
         assert!(contexts.iter().any(|s| s.contains("scheduled_message")));
         a.verify().unwrap();
@@ -1891,7 +1906,9 @@ mod tests {
             .archive
             .lock()
             .unwrap()
-            .db
+            .store
+            .sqlite()
+            .unwrap()
             .query_row(
                 "SELECT location FROM media WHERE id='photo:123:x'",
                 [],

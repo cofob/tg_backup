@@ -3,6 +3,56 @@ use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum Backend {
+    #[default]
+    Sqlite,
+    Clickhouse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClickHouse {
+    pub url: String,
+    pub database: String,
+    pub user: String,
+    pub password: Option<tg_backup_credentials::Secret>,
+    pub timeout_seconds: u64,
+}
+impl Default for ClickHouse {
+    fn default() -> Self {
+        Self {
+            url: "http://127.0.0.1:8123".into(),
+            database: "tg_backup".into(),
+            user: "default".into(),
+            password: None,
+            timeout_seconds: 30,
+        }
+    }
+}
+impl ClickHouse {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.url.starts_with("http://") || self.url.starts_with("https://"),
+            "ClickHouse URL must use HTTP or HTTPS"
+        );
+        ensure!(
+            !self.database.is_empty()
+                && self
+                    .database
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+            "invalid ClickHouse database name"
+        );
+        ensure!(
+            self.timeout_seconds > 0,
+            "ClickHouse timeout must be positive"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum EpochPeriod {
@@ -23,6 +73,9 @@ impl EpochPeriod {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub backend: Backend,
+    pub clickhouse: Option<ClickHouse>,
+    pub dataset_id: Option<String>,
     pub epoch: EpochPeriod,
     pub compression_level: i32,
     pub block_bytes: usize,
@@ -46,6 +99,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            backend: Backend::Sqlite,
+            clickhouse: None,
+            dataset_id: None,
             epoch: EpochPeriod::Monthly,
             compression_level: 9,
             block_bytes: 1024 * 1024,
@@ -70,6 +126,13 @@ impl Default for Config {
 impl Config {
     pub fn load(root: &Path) -> Result<Self> {
         let value: Self = toml::from_str(&std::fs::read_to_string(root.join("config.toml"))?)?;
+        if value.backend == Backend::Clickhouse {
+            value
+                .clickhouse
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("ClickHouse configuration is missing"))?
+                .validate()?;
+        }
         ensure!(
             (4096..=64 * 1024 * 1024).contains(&value.block_bytes),
             "block_bytes must be 4 KiB–64 MiB"
