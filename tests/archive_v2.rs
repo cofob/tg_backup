@@ -76,8 +76,7 @@ fn journal_recovery_occurrences_and_epoch_sealing() {
 fn catalog_indexes_are_migrated() {
     let dir = tempfile::tempdir().unwrap();
     let a = Archive::init(dir.path(), &Config::default()).unwrap();
-    a.db
-        .execute_batch("DROP INDEX observations_epoch_id; DROP INDEX payloads_pending_epoch;")
+    a.db.execute_batch("DROP INDEX observations_epoch_id; DROP INDEX payloads_pending_epoch;")
         .unwrap();
     drop(a);
     let a = Archive::open(dir.path(), true).unwrap();
