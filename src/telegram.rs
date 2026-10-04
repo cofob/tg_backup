@@ -1188,9 +1188,9 @@ impl Engine {
         for (index, v) in media {
             discover_media(&archive, &v, ids[index])?;
         }
-        for id in ids {
-            let record = archive.record(id)?;
-            archive.link_media(id, &record.data)?;
+        for (id, record) in ids.into_iter().zip(&records) {
+            let data = self.schema.decode(&record.root_type, &record.bytes)?;
+            archive.link_media(id, &data)?;
         }
         archive.db.execute(
             "UPDATE jobs SET updated=?2 WHERE id=?1",

@@ -1,9 +1,9 @@
-# tg_backup 2.4.4
+# tg_backup 2.4.5
 
-Fix media reconciliation startup on existing large catalogs.
+Fix capture I/O on large catalogs.
 
-- Initialize reconciliation cursors at the existing catalog high-water marks.
-- Reconcile only observations added after the upgrade.
-- Resume from the saved batch after an interrupted pass.
+- Link media from the decoded capture already in memory.
+- Stop rereading each new observation from the catalog before materialization.
+- Keep stored records and media references unchanged.
 
-Existing media references stay unchanged. New observations keep the same discovery and linking checks.
+This release includes the indexed media queue and high-water reconciliation cursors from 2.4.2–2.4.4.
