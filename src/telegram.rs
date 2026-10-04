@@ -3477,10 +3477,9 @@ mod tests {
         .unwrap();
         e.reconcile_media().unwrap();
         let a = e.archive.lock().unwrap();
-        let last: i64 = a
-            .db
-            .query_row("SELECT MAX(id) FROM observations", [], |r| r.get(0))
-            .unwrap();
+        let last: i64 =
+            a.db.query_row("SELECT MAX(id) FROM observations", [], |r| r.get(0))
+                .unwrap();
         assert_eq!(
             a.checkpoint("media_refs_cursor_v1").unwrap(),
             Some(json!(last))
