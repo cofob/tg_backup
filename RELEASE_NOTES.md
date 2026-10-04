@@ -1,9 +1,10 @@
-# tg_backup 2.4.6
+# tg_backup 2.4.7
 
-Fix the remaining sync I/O amplification.
+Scan all selected chat history before downloading media.
 
-- Keep small payloads in the durable catalog journal until one compression block is ready.
-- Stop opening and syncing epoch files after every Telegram response.
-- Index transformed-media hashes used by reconciliation.
+- Run one shared media pass after history and enrichment in each sync cycle.
+- Reconcile media and reset deferred files immediately before that pass.
+- Continue other chats after a history error. Stop before media on cancellation or the message limit.
+- Keep saved history checkpoints and partial media offsets.
 
-This release includes all sync fixes from 2.4.1–2.4.5.
+This release includes all sync fixes from 2.4.1–2.4.6.

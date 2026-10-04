@@ -130,6 +130,8 @@ struct Engine {
     dc_auth_lock: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     mock_rpc: Option<Mutex<std::collections::VecDeque<MockReply>>>,
+    #[cfg(test)]
+    mock_collectors: bool,
     client: Client,
     session: Arc<SqliteSession>,
     archive: Shared,
@@ -397,6 +399,8 @@ pub async fn sync(root: &Path, mut options: SyncOptions) -> Result<()> {
         dc_auth_lock: Arc::new(tokio::sync::Mutex::new(())),
         #[cfg(test)]
         mock_rpc: None,
+        #[cfg(test)]
+        mock_collectors: false,
         client: client.clone(),
         session: session.clone(),
         archive: archive.clone(),
@@ -439,6 +443,8 @@ pub async fn sync(root: &Path, mut options: SyncOptions) -> Result<()> {
         dc_auth_lock: engine.dc_auth_lock.clone(),
         #[cfg(test)]
         mock_rpc: None,
+        #[cfg(test)]
+        mock_collectors: false,
         client: client.clone(),
         session: session.clone(),
         archive: archive.clone(),
@@ -693,6 +699,18 @@ impl Engine {
         self.check_stop()?;
         #[cfg(test)]
         if let Some(queue) = &self.mock_rpc {
+            if self.mock_collectors
+                && !matches!(
+                    name,
+                    "messages.getDialogs" | "messages.getHistory" | "upload.getFile"
+                )
+            {
+                anyhow::bail!("collector unavailable in run fixture");
+            }
+            if self.mock_collectors && queue.lock().unwrap().is_empty() {
+                self.stop.cancel();
+                self.check_stop()?;
+            }
             let expected = queue.lock().unwrap().pop_front().expect("unexpected RPC");
             assert_eq!(name, expected.method);
             assert_eq!(args, expected.args);
@@ -1241,13 +1259,6 @@ impl Engine {
         }
         loop {
             self.check_stop()?;
-            self.progress("media_reconciliation", 0, None)?;
-            self.reconcile_media()?;
-            self.archive
-                .lock()
-                .unwrap()
-                .db
-                .execute("UPDATE media SET retry_at=0 WHERE status='deferred'", [])?;
             self.progress("coverage_preparation", 0, None)?;
             self.prepare_extra_coverage()?;
             self.progress("account_collectors", 0, None)?;
@@ -1285,9 +1296,7 @@ impl Engine {
                     )?;
                     tracing::warn!(peer=key,error=%e,"history incomplete");
                 }
-                self.progress("media", index as u64 + 1, Some(total))?;
-                self.download_pending().await?;
-                self.progress("media", index as u64 + 1, Some(total))?;
+                self.check_stop()?;
                 if self.message_limit()? {
                     return Ok(());
                 }
@@ -1296,6 +1305,17 @@ impl Engine {
             self.extra_enrichment().await?;
             self.progress("coverage_finalization", total, Some(total))?;
             self.finish_extra_coverage()?;
+            self.check_stop()?;
+            if self.message_limit()? {
+                return Ok(());
+            }
+            self.progress("media_reconciliation", total, Some(total))?;
+            self.reconcile_media()?;
+            self.archive
+                .lock()
+                .unwrap()
+                .db
+                .execute("UPDATE media SET retry_at=0 WHERE status='deferred'", [])?;
             self.progress("media", total, Some(total))?;
             self.download_pending().await?;
             self.progress("finalization", total, Some(total))?;
@@ -3100,6 +3120,7 @@ mod tests {
         Engine {
             dc_auth_lock: Arc::new(tokio::sync::Mutex::new(())),
             mock_rpc: None,
+            mock_collectors: false,
             client: Client::new(handle),
             session,
             archive: Arc::new(Mutex::new(a)),
@@ -3182,6 +3203,161 @@ mod tests {
 
     pub(super) fn message() -> Value {
         json!({"_":"message","id":17,"peer_id":{"_":"peerUser","user_id":"42"},"date":1700000000,"message":"private text","media":{"_":"messageMediaPhoto","photo":{"_":"photo","id":"123","access_hash":"456","file_reference":{"$bytes":"abcd"},"date":1700000000,"sizes":[{"_":"photoSize","type":"x","w":100,"h":100,"size":4}],"dc_id":2}}})
+    }
+    async fn run_fixture(root: &Path) -> Engine {
+        let mut e = fixture(
+            root,
+            Config {
+                metadata_refresh_seconds: 0,
+                ..Default::default()
+            },
+        )
+        .await;
+        {
+            let a = e.archive.lock().unwrap();
+            a.db.execute(
+                "INSERT INTO jobs VALUES('fixture','{}','running',0,0,'{}')",
+                [],
+            )
+            .unwrap();
+            cache_peer(
+                &a,
+                &json!({"_":"user","id":"43","access_hash":"124","first_name":"Other"}),
+                1,
+            )
+            .unwrap();
+        }
+        e.capture(
+            "Message",
+            &e.schema.encode("Message", &message()).unwrap(),
+            "history",
+            Some("user:42"),
+            None,
+            None,
+        )
+        .unwrap();
+        e.mock_collectors = true;
+        e.mock_rpc = Some(Mutex::new(Default::default()));
+        e
+    }
+    fn queue_cycle(e: &Engine, fail_first: bool, limit: u64, download: bool) {
+        let mut queue = e.mock_rpc.as_ref().unwrap().lock().unwrap();
+        for folder_id in [0, 1] {
+            queue.push_back(MockReply {
+                method: "messages.getDialogs",
+                args: json!({"folder_id":folder_id,"offset_date":0,"offset_id":0,"offset_peer":{"_":"inputPeerEmpty"},"limit":100,"hash":"0"}),
+                dc: None,
+                result: Ok(json!({"_":"messages.dialogs","dialogs":[],"messages":[],"chats":[],"users":[]})),
+            });
+        }
+        for id in [42, 43] {
+            for offset in [0, 17] {
+                let mut m = message();
+                m["peer_id"]["user_id"] = json!(id.to_string());
+                m.as_object_mut().unwrap().remove("media");
+                queue.push_back(MockReply {
+                    method: "messages.getHistory",
+                    args: json!({"peer":{"_":"inputPeerUser","user_id":id.to_string(),"access_hash":(id+81).to_string()},"offset_id":offset,"offset_date":0,"add_offset":0,"limit":limit,"max_id":0,"min_id":0,"hash":"0"}),
+                    dc: None,
+                    result: if fail_first && id == 42 { Err("history unavailable".into()) } else { Ok(json!({"_":"messages.messages","messages":if offset == 0 { vec![m] } else { vec![] },"chats":[],"users":[],"topics":[]})) },
+                });
+                if fail_first && id == 42 || limit == 1 {
+                    break;
+                }
+            }
+            if limit == 1 {
+                break;
+            }
+        }
+        if download {
+            let a = e.archive.lock().unwrap();
+            let (location, offset): (String, u64) =
+                a.db.query_row(
+                    "SELECT location,offset FROM media WHERE id='photo:123:x'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            queue.push_back(MockReply {
+                method: "upload.getFile",
+                args: json!({"location":serde_json::from_str::<Value>(&location).unwrap(),"offset":offset.to_string(),"limit":512*1024}),
+                dc: Some(2),
+                result: Ok(json!({"_":"upload.file","type":{"_":"storage.fileUnknown"},"mtime":0,"bytes":{"$bytes":hex::encode(&b"test"[offset as usize..])}})),
+            });
+        }
+    }
+    #[tokio::test]
+    async fn run_scans_all_history_before_resuming_media() {
+        for fail_first in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut e = run_fixture(dir.path()).await;
+            e.archive
+                .lock()
+                .unwrap()
+                .append_media("photo:123:x", 0, b"te")
+                .unwrap();
+            queue_cycle(&e, fail_first, 100, true);
+            e.run().await.unwrap();
+            assert!(e.mock_rpc.as_ref().unwrap().lock().unwrap().is_empty());
+            let a = e.archive.lock().unwrap();
+            let status: String =
+                a.db.query_row("SELECT status FROM media WHERE id='photo:123:x'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(status, "complete");
+            if fail_first {
+                let coverage: String =
+                    a.db.query_row(
+                        "SELECT status FROM coverage WHERE name='history:user:42'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(coverage, "incomplete");
+            }
+            a.verify().unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn run_stops_before_media_on_message_limit_or_cancel() {
+        for cancel in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut e = run_fixture(dir.path()).await;
+            queue_cycle(&e, false, if cancel { 100 } else { 1 }, false);
+            if cancel {
+                e.mock_rpc.as_ref().unwrap().lock().unwrap().truncate(3);
+            } else {
+                e.options.max_messages = Some(1);
+            }
+            let result = e.run().await;
+            assert_eq!(result.is_err(), cancel);
+            assert!(e.mock_rpc.as_ref().unwrap().lock().unwrap().is_empty());
+            let a = e.archive.lock().unwrap();
+            let offset: u64 =
+                a.db.query_row("SELECT offset FROM media WHERE id='photo:123:x'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(offset, 0);
+        }
+    }
+    #[tokio::test]
+    async fn continuous_run_scans_history_before_media_each_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = run_fixture(dir.path()).await;
+        e.options.continuous = true;
+        queue_cycle(&e, false, 100, true);
+        queue_cycle(&e, false, 100, false);
+        assert!(
+            e.run()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("sync interrupted")
+        );
+        assert!(e.mock_rpc.as_ref().unwrap().lock().unwrap().is_empty());
+        e.archive.lock().unwrap().verify().unwrap();
     }
     #[tokio::test]
     async fn own_or_personal_attachment_selector_inherits_message_ownership() {
