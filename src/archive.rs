@@ -690,7 +690,8 @@ impl Archive {
         );
         Ok(bytes)
     }
-    pub fn record(&self, id: i64) -> Result<Record> {
+    /// Metadata and decoded data only, without attachment and representation lookups.
+    pub(crate) fn record_data(&self, id: i64) -> Result<Record> {
         if self.store.clickhouse().is_some() {
             return self.ch_record(id);
         }
@@ -699,6 +700,13 @@ impl Archive {
         record.data = self
             .schema(&record.schema_hash)?
             .decode(&record.root_type, &self.payload(&record.payload_hash)?)?;
+        Ok(record)
+    }
+    pub fn record(&self, id: i64) -> Result<Record> {
+        if self.store.clickhouse().is_some() {
+            return self.ch_record(id);
+        }
+        let mut record = self.record_data(id)?;
         record.attachments = self.attachment_hashes(&record.data)?;
         let extended: bool = self.store.sqlite()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='representations')",

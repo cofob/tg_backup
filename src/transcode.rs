@@ -83,7 +83,7 @@ fn references_allow(a: &Archive, hash: &str, p: &Policy) -> Result<bool> {
     let cutoff = chrono::Utc::now().timestamp() - i64::from(p.min_age_days) * 86400;
     let mut any = false;
     for (_, observation) in a.media_observations(hash)? {
-        let record = a.record(observation)?;
+        let record = a.record_data(observation)?;
         if !selector.matches(&record.metadata)
             || (p.min_age_days > 0 && content_date(&record.data).is_none_or(|t| t > cutoff))
         {
@@ -109,6 +109,8 @@ pub fn enqueue(a: &Archive, p: &Policy, apply: bool, automatic: bool) -> Result<
         String::new()
     };
     let mut eligible = 0;
+    // The coordinator holds the archive lock during automatic scans.
+    let started = std::time::Instant::now();
     loop {
         let hashes = a.transcode_candidates(&last)?;
         if hashes.is_empty() {
@@ -130,6 +132,9 @@ pub fn enqueue(a: &Archive, p: &Policy, apply: bool, automatic: bool) -> Result<
                         automatic,
                     )?;
                 }
+            }
+            if automatic && started.elapsed() > std::time::Duration::from_secs(2) {
+                break;
             }
         }
         if automatic {
