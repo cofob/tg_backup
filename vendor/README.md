@@ -9,7 +9,7 @@ These source copies preserve upstream licenses and are excluded from workspace m
   This release uses the dependency-free icy_sixel 0.1 encoder and supports Rust 1.88;
   newer releases pull a quantizer requiring Rust 1.90.
 - `kasuari` 0.4.12 (MIT/Apache-2.0): update hashbrown 0.16 → 0.17, aligning with
-  Ratatui and rusqlite. No source changes.
+  Ratatui and rusqlite. Drop the deprecated `core::f64` import in `solver.rs`.
 
 Only library sources, manifests, build script, README, and licenses are retained.
 App/example/dev-test manifest entries are omitted. No dependency-policy exceptions

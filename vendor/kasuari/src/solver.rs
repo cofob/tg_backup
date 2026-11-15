@@ -1,6 +1,5 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::f64;
 
 use hashbrown::hash_map::Entry;
 use hashbrown::{HashMap, HashSet};

@@ -28,6 +28,7 @@ pub enum CommitPoint {
 }
 
 type BlockCache = std::cell::RefCell<HashMap<(String, i64), std::sync::Arc<Vec<u8>>>>;
+type RepackRow = (i64, String, String, String, Option<Vec<u8>>);
 type PayloadLocation = (
     String,
     String,
@@ -68,7 +69,6 @@ CREATE TABLE epochs(id INTEGER PRIMARY KEY,name TEXT NOT NULL,path TEXT UNIQUE N
 CREATE TABLE payloads(hash TEXT PRIMARY KEY,schema_hash TEXT NOT NULL REFERENCES schemas(hash),root_type TEXT NOT NULL,epoch INTEGER NOT NULL REFERENCES epochs(id),block INTEGER,offset INTEGER,length INTEGER NOT NULL,journal BLOB);
 CREATE TABLE observations(id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT NOT NULL,kind TEXT NOT NULL,observed INTEGER NOT NULL,source TEXT NOT NULL,payload TEXT NOT NULL REFERENCES payloads(hash),epoch INTEGER NOT NULL REFERENCES epochs(id),metadata TEXT NOT NULL,partial INTEGER NOT NULL,deleted INTEGER NOT NULL,transformed INTEGER NOT NULL DEFAULT 0,replay_key TEXT UNIQUE);
 CREATE INDEX observations_key ON observations(key,id);
-CREATE INDEX observations_time ON observations(observed,id);
 CREATE INDEX observations_kind ON observations(kind,id);
 CREATE INDEX observations_payload ON observations(payload);
 CREATE INDEX observations_epoch_id ON observations(epoch,id);
@@ -92,7 +92,6 @@ CREATE TABLE dictionaries(id INTEGER PRIMARY KEY,data BLOB NOT NULL,hash TEXT NO
 CREATE TABLE blocks(id INTEGER PRIMARY KEY,codec TEXT NOT NULL,dictionary INTEGER,raw_size INTEGER NOT NULL,checksum TEXT NOT NULL,data BLOB NOT NULL);
 CREATE TABLE payloads(hash TEXT PRIMARY KEY,schema_hash TEXT NOT NULL,root_type TEXT NOT NULL,block INTEGER NOT NULL,offset INTEGER NOT NULL,length INTEGER NOT NULL);
 CREATE TABLE observations(id INTEGER PRIMARY KEY,key TEXT NOT NULL,kind TEXT NOT NULL,observed INTEGER NOT NULL,source TEXT NOT NULL,payload TEXT NOT NULL,metadata TEXT NOT NULL,partial INTEGER NOT NULL,deleted INTEGER NOT NULL,transformed INTEGER NOT NULL,replay_key TEXT);
-CREATE INDEX observations_key ON observations(key,id);
 "#;
 pub(crate) fn connection(path: &Path, write: bool) -> Result<Connection> {
     let flags = if write {
@@ -419,8 +418,8 @@ impl Archive {
             if let Some(replay) = &c.replay_key
                 && let Some(id) = tx
                     .query_row(
-                        "SELECT id FROM observations WHERE replay_key=?1",
-                        [replay],
+                        "SELECT id FROM observations WHERE replay_key IN (?1,?2)",
+                        [replay, &replay_digest(replay)],
                         |r| r.get::<_, i64>(0),
                     )
                     .optional()?
@@ -429,7 +428,7 @@ impl Archive {
                 continue;
             }
             tx.execute("INSERT OR IGNORE INTO payloads(hash,schema_hash,root_type,epoch,length,journal) VALUES(?1,?2,?3,?4,?5,?6)",params![hash,schema_hash,c.root_type,epoch,c.bytes.len(),c.bytes])?;
-            tx.execute("INSERT INTO observations(key,kind,observed,source,payload,epoch,metadata,partial,deleted,replay_key) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![c.key,c.kind,c.observed_at,c.source,hash,epoch,c.metadata.to_string(),c.partial,c.deleted,c.replay_key])?;
+            tx.execute("INSERT INTO observations(key,kind,observed,source,payload,epoch,metadata,partial,deleted,replay_key) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![c.key,c.kind,c.observed_at,c.source,hash,epoch,c.metadata.to_string(),c.partial,c.deleted,c.replay_key.as_deref().map(replay_digest)])?;
             let id = tx.last_insert_rowid();
             ids.push(id);
             if self.config.index_history {
@@ -525,7 +524,7 @@ impl Archive {
                 |r| r.get(0),
             )?;
             let mut epoch = connection(&self.root.join(path), true)?;
-            let mut rows=self.store.sqlite()?.prepare("SELECT hash,schema_hash,root_type,journal FROM payloads WHERE epoch=?1 AND journal IS NOT NULL ORDER BY hash")?;
+            let mut rows=self.store.sqlite()?.prepare("SELECT hash,schema_hash,root_type,journal FROM payloads WHERE epoch=?1 AND journal IS NOT NULL ORDER BY rowid")?;
             let mut iter = rows.query([epoch_id])?;
             let mut payloads = vec![];
             let mut raw = vec![];
@@ -953,6 +952,9 @@ pub fn read_block(db: &Connection, id: i64) -> Result<Vec<u8>> {
     );
     Ok(bytes)
 }
+fn replay_digest(raw: &str) -> String {
+    format!("b3:{}", &blake3::hash(raw.as_bytes()).to_hex()[..32])
+}
 pub fn sync_dir(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
     Ok(())
@@ -986,6 +988,77 @@ pub struct Maintenance {
     pub retention: Retention,
 }
 impl Archive {
+    fn replace_catalog(&mut self, staged: &Path) -> Result<()> {
+        self.store
+            .sqlite()?
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
+        let old = std::mem::replace(self.store.sqlite_mut()?, Connection::open_in_memory()?);
+        drop(old);
+        fs::rename(staged, self.root.join("catalog.sqlite3"))?;
+        sync_dir(&self.root)?;
+        self.store =
+            crate::storage::Storage::Sqlite(connection(&self.root.join("catalog.sqlite3"), true)?);
+        self.blocks.borrow_mut().clear();
+        Ok(())
+    }
+    /// Rewrites raw replay keys as digests, drops unused indexes and vacuums the catalog.
+    pub fn shrink(&mut self, apply: bool) -> Result<Value> {
+        ensure!(self.writable, "maintenance needs writer access");
+        ensure!(
+            self.store.clickhouse().is_none(),
+            "shrink supports only SQLite"
+        );
+        let db = self.store.sqlite()?;
+        let (raw, bytes) = db.query_row("SELECT count(*),coalesce(sum(length(replay_key)),0) FROM observations WHERE replay_key IS NOT NULL AND replay_key NOT LIKE 'b3:%'", [], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        let time = db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='observations_time'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? > 0;
+        let mut report = json!({"apply":apply,"raw_replay_keys":raw,"raw_replay_bytes":bytes,"observations_time_index":time});
+        if !apply {
+            return Ok(report);
+        }
+        let (mut after, mut converted, mut skipped) = (0i64, 0u64, 0u64);
+        loop {
+            let tx = self.store.sqlite_mut()?.transaction()?;
+            let rows: Vec<(i64, String)> = tx.prepare("SELECT id,replay_key FROM observations WHERE id>?1 AND replay_key IS NOT NULL AND replay_key NOT LIKE 'b3:%' ORDER BY id LIMIT 10000")?.query_map([after], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+            let Some((last, _)) = rows.last() else { break };
+            after = *last;
+            for (id, key) in &rows {
+                match tx.execute(
+                    "UPDATE OR IGNORE observations SET replay_key=?2 WHERE id=?1",
+                    params![id, replay_digest(key)],
+                )? {
+                    0 => skipped += 1,
+                    _ => converted += 1,
+                }
+            }
+            tx.commit()?;
+        }
+        self.store
+            .sqlite()?
+            .execute_batch("DROP INDEX IF EXISTS observations_time;")?;
+        let readers = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.root.join("readers.lock"))?;
+        readers.lock_exclusive()?;
+        let staged = self
+            .root
+            .join("staging")
+            .join(format!("catalog-{}.sqlite3", uuid::Uuid::new_v4()));
+        self.store.sqlite()?.execute(
+            "VACUUM INTO ?1",
+            [staged.to_str().context("dataset path must be UTF-8")?],
+        )?;
+        File::open(&staged)?.sync_all()?;
+        self.replace_catalog(&staged)?;
+        drop(readers);
+        report["converted"] = json!(converted);
+        report["skipped"] = json!(skipped);
+        Ok(report)
+    }
     pub fn maintain(&mut self, options: &Maintenance) -> Result<Value> {
         self.maintain_with_hook(options, |_| Ok(()))
     }
@@ -1230,14 +1303,15 @@ impl Archive {
             let mut hashes: Vec<(String, String, String, usize, usize)> = vec![];
             let mut raw = vec![];
             // Read a bounded page at a time so writing payload locations never invalidates an iterator.
-            let mut last = String::new();
+            // Insertion order keeps related payloads (pages and their messages) in one block.
+            let mut last = 0i64;
             loop {
-                let batch:Vec<(String,String,String,Option<Vec<u8>>)>=stage.prepare(&format!("SELECT hash,schema_hash,root_type,journal FROM payloads WHERE epoch IN ({list}) AND hash>?1 ORDER BY hash LIMIT 32"))?.query_map([&last],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
+                let batch:Vec<RepackRow>=stage.prepare(&format!("SELECT rowid,hash,schema_hash,root_type,journal FROM payloads WHERE epoch IN ({list}) AND rowid>?1 ORDER BY rowid LIMIT 32"))?.query_map([last],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?.collect::<rusqlite::Result<_>>()?;
                 if batch.is_empty() {
                     break;
                 }
-                for (hash, schema, root, journal) in batch {
-                    last = hash.clone();
+                for (row, hash, schema, root, journal) in batch {
+                    last = row;
                     let bytes = journal.map(Ok).unwrap_or_else(|| self.payload(&hash))?;
                     hashes.push((hash, schema, root, raw.len(), bytes.len()));
                     raw.extend(bytes);
@@ -1357,16 +1431,7 @@ impl Archive {
         File::open(&staged_path)?.sync_all()?;
         hook(CommitPoint::GenerationReady)?;
         sync_dir(&self.root.join("epochs"))?;
-        self.store
-            .sqlite()?
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
-        let old = std::mem::replace(self.store.sqlite_mut()?, Connection::open_in_memory()?);
-        drop(old);
-        fs::rename(&staged_path, self.root.join("catalog.sqlite3"))?;
-        sync_dir(&self.root)?;
-        self.store =
-            crate::storage::Storage::Sqlite(connection(&self.root.join("catalog.sqlite3"), true)?);
-        self.blocks.borrow_mut().clear();
+        self.replace_catalog(&staged_path)?;
         hook(CommitPoint::GenerationPublished)?;
         // Readers were drained before replacement, so no process can still reference retired files.
         let retired: Vec<String> = self

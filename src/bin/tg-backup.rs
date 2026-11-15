@@ -129,6 +129,10 @@ enum MaintenanceCommand {
         #[arg(long)]
         apply: bool,
     },
+    Shrink {
+        #[arg(long)]
+        apply: bool,
+    },
 }
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -392,6 +396,7 @@ async fn main() -> Result<()> {
                         })?)?;
                     }
                 }
+                MaintenanceCommand::Shrink { apply } => print(&a.shrink(apply)?)?,
             }
         }
     }

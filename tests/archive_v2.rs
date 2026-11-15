@@ -839,3 +839,112 @@ fn missing_dictionary_is_detected_and_dictionary_blocks_round_trip() {
     epoch.execute("DELETE FROM dictionaries", []).unwrap();
     assert!(a.verify().is_err());
 }
+fn count(a: &Archive, sql: &str) -> i64 {
+    a.store
+        .sqlite()
+        .unwrap()
+        .query_row(sql, [], |r| r.get(0))
+        .unwrap()
+}
+fn raw_replay(t: i64) -> Capture {
+    let mut c = item("raw", t);
+    c.replay_key = Some("event:1".into());
+    c
+}
+#[test]
+fn replay_keys_are_digested_and_old_raw_keys_still_dedupe() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = Archive::init(dir.path(), &Config::default()).unwrap();
+    let schema = a.register_schema(1, SCHEMA).unwrap();
+    let c = raw_replay(1_800_000_000_000_000);
+    let ids = a.ingest(&schema, std::slice::from_ref(&c), None).unwrap();
+    a.store
+        .sqlite()
+        .unwrap()
+        .execute("UPDATE observations SET replay_key='event:1'", [])
+        .unwrap();
+    assert_eq!(
+        a.ingest(&schema, std::slice::from_ref(&c), None).unwrap(),
+        ids
+    );
+    assert_eq!(count(&a, "SELECT COUNT(*) FROM observations"), 1);
+    let mut next = c;
+    next.replay_key = Some("event:2".into());
+    next.observed_at += 1;
+    a.ingest(&schema, &[next], None).unwrap();
+    let key: String = a
+        .store
+        .sqlite()
+        .unwrap()
+        .query_row(
+            "SELECT replay_key FROM observations WHERE replay_key!='event:1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(key.starts_with("b3:") && key.len() == 35, "{key}");
+}
+#[test]
+fn shrink_converts_raw_replay_keys_and_drops_time_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = Archive::init(dir.path(), &Config::default()).unwrap();
+    let schema = a.register_schema(1, SCHEMA).unwrap();
+    let c = raw_replay(1_800_000_000_000_000);
+    let ids = a.ingest(&schema, std::slice::from_ref(&c), None).unwrap();
+    let db = a.store.sqlite().unwrap();
+    db.execute("UPDATE observations SET replay_key='event:1'", [])
+        .unwrap();
+    db.execute(
+        "CREATE INDEX observations_time ON observations(observed,id)",
+        [],
+    )
+    .unwrap();
+    let before = a.record(ids[0]).unwrap().data;
+    let time_index = "SELECT COUNT(*) FROM sqlite_master WHERE name='observations_time'";
+    let raw_keys = "SELECT COUNT(*) FROM observations WHERE replay_key='event:1'";
+    let report = a.shrink(false).unwrap();
+    assert_eq!(report["raw_replay_keys"], 1);
+    assert_eq!(report["observations_time_index"], true);
+    assert_eq!(count(&a, time_index), 1);
+    assert_eq!(count(&a, raw_keys), 1);
+    a.shrink(true).unwrap();
+    assert_eq!(count(&a, time_index), 0);
+    assert_eq!(count(&a, raw_keys), 0);
+    assert_eq!(
+        count(
+            &a,
+            "SELECT COUNT(*) FROM observations WHERE replay_key LIKE 'b3:%' AND length(replay_key)=35"
+        ),
+        1
+    );
+    a.verify().unwrap();
+    assert_eq!(a.record(ids[0]).unwrap().data, before);
+    assert_eq!(a.ingest(&schema, &[c], None).unwrap(), ids);
+    assert_eq!(count(&a, "SELECT COUNT(*) FROM observations"), 1);
+}
+#[test]
+fn new_archives_have_no_redundant_indexes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = Archive::init(dir.path(), &Config::default()).unwrap();
+    let schema = a.register_schema(1, SCHEMA).unwrap();
+    a.ingest(&schema, &[item("hello", 1_800_000_000_000_000)], None)
+        .unwrap();
+    a.materialize().unwrap();
+    assert_eq!(
+        count(
+            &a,
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='observations_time'"
+        ),
+        0
+    );
+    let epoch = dir.path().join(&a.epochs().unwrap()[0].2);
+    let db = rusqlite::Connection::open(epoch).unwrap();
+    let n: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='observations_key'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0);
+}
