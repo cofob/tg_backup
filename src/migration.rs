@@ -155,7 +155,6 @@ pub(crate) fn export_sqlite(
     ))?;
     let names = statement
         .column_names()
-        .iter()
         .map(|s| s.to_string())
         .collect::<Vec<_>>();
     let mut rows = statement.query([after])?;
@@ -472,7 +471,7 @@ fn copy_files(source: &Archive, target: &Archive, file_root: &Path) -> Result<()
     let session = source.root.join("session.sqlite3");
     if session.exists() {
         let db = Connection::open_with_flags(session, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        db.backup("main", target.root.join("session.sqlite3"), None)?;
+        db.backup("main", target.root.join("session.sqlite3"), None::<fn(_)>)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

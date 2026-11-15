@@ -804,11 +804,7 @@ impl Archive {
             .store
             .sqlite()?
             .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))?;
-        let names = st
-            .column_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>();
+        let names = st.column_names().map(|s| s.to_string()).collect::<Vec<_>>();
         let mut rows = st.query([])?;
         let mut out = vec![];
         while let Some(r) = rows.next()? {

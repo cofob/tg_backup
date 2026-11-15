@@ -21,13 +21,13 @@ pub fn execute(root: &Path, task: &Task) -> Result<Value> {
         source
             .store
             .sqlite()?
-            .backup("main", staging.join("catalog.sqlite3"), None)?;
+            .backup("main", staging.join("catalog.sqlite3"), None::<fn(_)>)?;
         for (_, _, path, _) in source.epochs()? {
             let input = Connection::open_with_flags(
                 root.join(&path),
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             )?;
-            input.backup("main", staging.join(path), None)?;
+            input.backup("main", staging.join(path), None::<fn(_)>)?;
         }
         for hash in source.complete_attachment_hashes()? {
             let from = crate::media::attachment_path(root, &hash)?;

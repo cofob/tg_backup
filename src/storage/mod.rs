@@ -333,11 +333,7 @@ pub(crate) fn read_rows<T: CatalogRow>(db: &Connection, query: &Select) -> Resul
         T::SQLITE_TABLE,
         query.sql::<T>()?
     ))?;
-    let names = st
-        .column_names()
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
+    let names = st.column_names().map(|s| s.to_string()).collect::<Vec<_>>();
     let mut rows = st.query(params_from_iter(
         query.filters.iter().map(|(_, _, v)| sql_value(v)),
     ))?;

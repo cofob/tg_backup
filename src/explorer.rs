@@ -119,7 +119,7 @@ impl Archive {
             );
             candidate
         };
-        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let mut db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; BEGIN;")?;
         let started = std::time::Instant::now();
         db.progress_handler(10000, Some(move || started.elapsed().as_secs() >= 2))?;
@@ -146,7 +146,7 @@ impl Archive {
     pub fn explore(&self, request: &BrowseRequest) -> Result<BrowsePage> {
         let revision = crate::storage::REVISION;
         let _deadline = if self.store.clickhouse().is_none() {
-            Some(Deadline::new(self.store.sqlite()?)?)
+            Some(Deadline::new(self.store.sqlite()?))
         } else {
             None
         };
@@ -939,17 +939,20 @@ pub fn execute(root: &Path, request: Request) -> Result<Response> {
     }
 }
 
-struct Deadline<'a>(&'a Connection);
-impl<'a> Deadline<'a> {
-    fn new(db: &'a Connection) -> Result<Self> {
-        let started = std::time::Instant::now();
-        db.progress_handler(10000, Some(move || started.elapsed().as_secs() >= 2))?;
-        Ok(Self(db))
-    }
-}
-impl Drop for Deadline<'_> {
-    fn drop(&mut self) {
-        let _ = self.0.progress_handler(0, None::<fn() -> bool>);
+/// Interrupts the connection after two seconds unless dropped first.
+struct Deadline(#[allow(dead_code)] std::sync::mpsc::Sender<()>);
+impl Deadline {
+    fn new(db: &Connection) -> Self {
+        let handle = db.get_interrupt_handle();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if rx.recv_timeout(std::time::Duration::from_secs(2))
+                == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            {
+                handle.interrupt();
+            }
+        });
+        Self(tx)
     }
 }
 
