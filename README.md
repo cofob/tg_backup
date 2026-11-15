@@ -6,7 +6,7 @@ V2 starts a new archive dataset and does not import v1 backup data. A standalone
 
 ## Build and start
 
-Requires Rust 1.89 or newer and a C/C++ toolchain. CI uses Rust 1.98.1 on Linux and macOS. SQLite and zstd are bundled dependencies.
+Requires Rust 1.89 or newer and a C/C++ toolchain. CI uses Rust 1.100.0 on Linux and macOS. SQLite and zstd are bundled dependencies.
 
 ```sh
 cargo build --locked --release --workspace --bins

@@ -50,14 +50,14 @@ jobs:
         with:
           persist-credentials: false
       - name: Rust toolchain
-        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
+        run: rustup toolchain install 1.100.0 --profile minimal --component rustfmt,clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          key: ${{ matrix.os }}-1.98.1
+          key: ${{ matrix.os }}-1.100.0
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-      - run: cargo +1.98.1 fmt --all --check
-      - run: cargo +1.98.1 clippy --locked --workspace --all-targets -- -D warnings
-      - run: cargo +1.98.1 test --locked --workspace --all-targets
+      - run: cargo +1.100.0 fmt --all --check
+      - run: cargo +1.100.0 clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo +1.100.0 test --locked --workspace --all-targets
       - name: Test both storage backends and migration
         if: runner.os == 'Linux'
         run: |
@@ -66,11 +66,11 @@ jobs:
             if docker exec clickhouse clickhouse-client --query 'SELECT 1'; then break; fi
             sleep 1
           done
-          TG_BACKUP_CLICKHOUSE_URL=http://127.0.0.1:8123 cargo +1.98.1 test --locked --test backends
-          TG_BACKUP_CLICKHOUSE_URL=http://127.0.0.1:8123 cargo +1.98.1 test --locked --lib clickhouse_sync_capture_and_resume
+          TG_BACKUP_CLICKHOUSE_URL=http://127.0.0.1:8123 cargo +1.100.0 test --locked --test backends
+          TG_BACKUP_CLICKHOUSE_URL=http://127.0.0.1:8123 cargo +1.100.0 test --locked --lib clickhouse_sync_capture_and_resume
       - name: Smoke-test both terminal explorers
         run: |
-          cargo +1.98.1 build --locked --workspace --bins
+          cargo +1.100.0 build --locked --workspace --bins
           python3 ci/tui-smoke.py
       - name: Test real media codecs
         if: runner.os == 'Linux'
@@ -79,12 +79,12 @@ jobs:
             sudo apt-get update
             sudo apt-get install --no-install-recommends -y ffmpeg
           fi
-          cargo +1.98.1 test --locked --test operations real_webp_transcode -- --ignored
+          cargo +1.100.0 test --locked --test operations real_webp_transcode -- --ignored
       - name: Measure synthetic archive storage and peak memory
         if: runner.os == 'Linux'
-        run: /usr/bin/time -v cargo +1.98.1 test --locked --workspace --test archive_v2 synthetic_archive_storage_report -- --ignored --nocapture
+        run: /usr/bin/time -v cargo +1.100.0 test --locked --workspace --test archive_v2 synthetic_archive_storage_report -- --ignored --nocapture
       - if: ${{ !inputs.skip_release_build }}
-        run: cargo +1.98.1 build --locked --workspace --release --bins
+        run: cargo +1.100.0 build --locked --workspace --release --bins
       - name: Enforce client dependency isolation
         run: ci/client-isolation.sh
 
@@ -94,7 +94,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - run: rustup toolchain install 1.98.1 --profile minimal
+      - run: rustup toolchain install 1.100.0 --profile minimal
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: cargo-deny-0.20.2
@@ -134,7 +134,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y musl-tools binutils cmake
-          rustup toolchain install 1.98.1 --profile minimal --target "$TARGET"
+          rustup toolchain install 1.100.0 --profile minimal --target "$TARGET"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}-client
@@ -144,7 +144,7 @@ jobs:
           TARGET: ${{ matrix.target }}
           CC: musl-gcc
           RUSTFLAGS: -C target-feature=+crt-static -C linker=musl-gcc
-        run: cargo +1.98.1 build --locked --release -p tg-backup-client --target "$TARGET"
+        run: cargo +1.100.0 build --locked --release -p tg-backup-client --target "$TARGET"
       - name: Verify and package
         env:
           TARGET: ${{ matrix.target }}
