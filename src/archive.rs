@@ -104,7 +104,10 @@ pub(crate) fn connection(path: &Path, write: bool) -> Result<Connection> {
     db.busy_timeout(Duration::from_secs(30))?;
     db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF;")?;
     if write {
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
+        // Without a limit, a reset WAL keeps the size of its largest burst forever.
+        db.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA journal_size_limit=67108864;",
+        )?;
     } else {
         db.execute_batch("PRAGMA query_only=ON;")?;
     }

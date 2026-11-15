@@ -2739,7 +2739,7 @@ fn deletion_records(
         let shortcut = integer(&v["shortcut_id"]).context("deleted shortcut ID")?;
         let prefix = format!("account/quick_reply:{shortcut}/message:");
         let mut targets = a
-            .current_observations("quick_reply_message", Some(&prefix))?
+            .current_observations("quick_reply_message", &prefix)?
             .into_iter()
             .map(|r| (r.key, r.kind))
             .collect::<Vec<_>>();
@@ -2790,14 +2790,7 @@ fn deletion_records(
         } else if let Some(channel) = integer(&v["channel_id"]) {
             Some(format!("channel:{channel}/message:{id}"))
         } else {
-            let keys = a
-                .current_observations("message", None)?
-                .into_iter()
-                .filter(|r| {
-                    !r.key.starts_with("channel:") && r.key.ends_with(&format!("/message:{id}"))
-                })
-                .map(|r| r.key)
-                .collect::<Vec<_>>();
+            let keys = a.private_message_keys(id)?;
             if keys.len() == 1 {
                 Some(keys[0].clone())
             } else {
@@ -3731,6 +3724,9 @@ mod tests {
             .len(),
             1
         );
+        // Resolution must stay an index lookup on large archives, not a head scan.
+        let plan: String = a.store.sqlite().unwrap().query_row("EXPLAIN QUERY PLAN SELECT key FROM heads WHERE instr(key,'/message:')>0 AND substr(key,instr(key,'/message:'))=?1", ["/message:17"], |r| r.get(3)).unwrap();
+        assert!(plan.contains("heads_message_suffix"), "{plan}");
         a.verify().unwrap();
     }
     #[tokio::test]

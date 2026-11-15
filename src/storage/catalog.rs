@@ -56,15 +56,18 @@ impl Archive {
     pub(crate) fn current_observations(
         &self,
         kind: &str,
-        prefix: Option<&str>,
+        prefix: &str,
     ) -> Result<Vec<ObservationRow>> {
         let mut rows = vec![];
-        for head in self
-            .store
-            .all::<HeadRow>()?
-            .into_iter()
-            .filter(|r| prefix.is_none_or(|p| r.key.starts_with(p)))
-        {
+        // Key range scan: never load every head of a large archive.
+        let range = Select {
+            filters: vec![
+                ("key", ">=", json!(prefix)),
+                ("key", "<", json!(format!("{prefix}\u{10ffff}"))),
+            ],
+            ..Select::default()
+        };
+        for head in self.store.select::<HeadRow>(&range)? {
             let row = self
                 .store
                 .get::<ObservationRow>("id", head.observation)?
@@ -74,6 +77,27 @@ impl Archive {
             }
         }
         Ok(rows)
+    }
+    /// Keys of private/basic-group messages with this account-wide ID.
+    pub(crate) fn private_message_keys(&self, id: i64) -> Result<Vec<String>> {
+        let suffix = format!("/message:{id}");
+        let keys: Vec<String> = match self.store.sqlite() {
+            // Matches the expression index heads_message_suffix.
+            Ok(db) => db
+                .prepare_cached("SELECT key FROM heads WHERE instr(key,'/message:')>0 AND substr(key,instr(key,'/message:'))=?1")?
+                .query_map([&suffix], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?,
+            Err(_) => self
+                .store
+                .select::<HeadRow>(&Select::eq("key", format!("%{suffix}")).with_operator("LIKE"))?
+                .into_iter()
+                .map(|r| r.key)
+                .collect(),
+        };
+        Ok(keys
+            .into_iter()
+            .filter(|k| (k.starts_with("user:") || k.starts_with("chat:")) && k.ends_with(&suffix))
+            .collect())
     }
     pub(crate) fn clear_checkpoints(&self, key: &str, prefix: &str) -> Result<()> {
         for row in self
@@ -349,24 +373,35 @@ impl Archive {
         }
         Ok(rows.into_values().collect())
     }
+    /// Indexed hash pages: the periodic scan must not load the whole media table.
     pub(crate) fn transcode_candidates(&self, after: &str) -> Result<Vec<String>> {
-        let representations = self
-            .store
-            .all::<RepresentationRow>()?
-            .into_iter()
-            .map(|r| r.hash)
-            .collect::<BTreeSet<_>>();
-        Ok(self
-            .store
-            .all::<MediaRow>()?
-            .into_iter()
-            .filter(|r| r.status == "complete")
-            .filter_map(|r| r.hash)
-            .filter(|hash| hash.as_str() > after && !representations.contains(hash))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .take(32)
-            .collect())
+        let mut hashes = BTreeSet::new();
+        let mut cursor = after.to_owned();
+        while hashes.len() < 32 {
+            let page = self.store.select::<MediaRow>(&Select {
+                filters: vec![("hash", ">", json!(cursor))],
+                order: Some("hash"),
+                limit: Some(256),
+            })?;
+            let Some(hash) = page.last().and_then(|r| r.hash.clone()) else {
+                break;
+            };
+            cursor = hash;
+            for hash in page
+                .into_iter()
+                .filter(|r| r.status == "complete")
+                .filter_map(|r| r.hash)
+            {
+                if self
+                    .store
+                    .select::<RepresentationRow>(&Select::eq("hash", hash.clone()))?
+                    .is_empty()
+                {
+                    hashes.insert(hash);
+                }
+            }
+        }
+        Ok(hashes.into_iter().take(32).collect())
     }
     pub(crate) fn work_row(&self, sequence: i64) -> Result<WorkRow> {
         self.store

@@ -301,7 +301,7 @@ impl Engine {
         let prefix = format!("{peer}/scheduled_message:");
         // Do not remove or supersede updates received while the RPC was in flight.
         let previous = a
-            .current_observations("scheduled_message", Some(&prefix))?
+            .current_observations("scheduled_message", &prefix)?
             .into_iter()
             .filter(|r| r.deleted == 0 && r.observed <= requested_at)
             .map(|r| (r.key, r.metadata))

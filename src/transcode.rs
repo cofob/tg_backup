@@ -176,20 +176,43 @@ fn number(v: &Value) -> Option<f64> {
 fn skipped(reason: &str) -> Value {
     json!({"state":"skipped","reason":reason})
 }
-fn run_ffmpeg(args: &[String]) -> Result<()> {
-    let output = crate::diagnostics::output(
-        Command::new("ffmpeg")
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped()),
-    )
-    .context("starting FFmpeg; install FFmpeg or use the ffmpeg image")?;
+/// An encoder can deadlock after a fatal allocation; FFmpeg then stops writing progress.
+const FFMPEG_STALL: std::time::Duration = std::time::Duration::from_secs(900);
+/// `progress` is the `-progress` file in `args`; a stale file stops FFmpeg.
+fn run_ffmpeg(args: &[String], progress: &Path) -> Result<()> {
+    let mut child = Command::new("ffmpeg")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("starting FFmpeg; install FFmpeg or use the ffmpeg image")?;
+    let stderr = child.stderr.take().context("FFmpeg stderr")?;
+    let drain = std::thread::spawn(move || crate::diagnostics::tail(stderr));
+    let started = std::time::SystemTime::now();
+    let mut stalled = false;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        let active = std::fs::metadata(progress)
+            .and_then(|m| m.modified())
+            .map_or(started, |t| t.max(started));
+        if !stalled && active.elapsed().unwrap_or_default() > FFMPEG_STALL {
+            stalled = true;
+            child.kill()?;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    };
+    let stderr = drain
+        .join()
+        .map_err(|_| anyhow::anyhow!("FFmpeg stderr reader panicked"))??;
     ensure!(
-        output.status.success(),
-        "FFmpeg failed ({}); original retained; stderr: {}",
-        output.status,
-        crate::diagnostics::text(&output.stderr)
+        !stalled && status.success(),
+        "FFmpeg failed ({}{}); original retained; stderr: {}",
+        status,
+        if stalled { ", no progress" } else { "" },
+        crate::diagnostics::text(&stderr)
     );
     Ok(())
 }
@@ -407,7 +430,7 @@ pub fn execute(root: &Path, task: &Task, r: &Resources) -> Result<Value> {
         "2".into(),
     ]);
     args.push(staging.to_string_lossy().into());
-    run_ffmpeg(&args)
+    run_ffmpeg(&args, &progress_path)
         .with_context(|| format!("encoding {} to {}", input.display(), staging.display()))?;
     let output = probe(&staging).context("probing encoded media")?;
     let outstreams = output["streams"]
@@ -436,20 +459,27 @@ pub fn execute(root: &Path, task: &Task, r: &Resources) -> Result<Value> {
         let out = number(&output["format"]["duration"]).context("missing output duration")?;
         ensure!((d - out).abs() <= 0.5, "duration changed");
     }
-    run_ffmpeg(&[
-        "-v".into(),
-        "error".into(),
-        "-xerror".into(),
-        "-threads".into(),
-        threads,
-        "-i".into(),
-        staging.to_string_lossy().into(),
-        "-map".into(),
-        "0".into(),
-        "-f".into(),
-        "null".into(),
-        "-".into(),
-    ])
+    run_ffmpeg(
+        &[
+            "-v".into(),
+            "error".into(),
+            "-xerror".into(),
+            "-threads".into(),
+            threads,
+            "-progress".into(),
+            progress_path.to_string_lossy().into(),
+            "-stats_period".into(),
+            "2".into(),
+            "-i".into(),
+            staging.to_string_lossy().into(),
+            "-map".into(),
+            "0".into(),
+            "-f".into(),
+            "null".into(),
+            "-".into(),
+        ],
+        &progress_path,
+    )
     .with_context(|| format!("validating encoded media by decoding {}", staging.display()))?;
     let output_bytes = std::fs::metadata(&staging)?.len();
     if output_bytes >= bytes {
