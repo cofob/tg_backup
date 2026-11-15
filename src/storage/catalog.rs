@@ -129,6 +129,9 @@ impl Archive {
             ..Default::default()
         })
     }
+    pub(crate) fn peers_unordered(&self) -> Result<Vec<PeerRow>> {
+        self.store.all()
+    }
     pub(crate) fn peer_metadata(&self, key: &str, metadata: &Value) -> Result<()> {
         if let Some(mut row) = self.peer(key)? {
             row.metadata = metadata.to_string();

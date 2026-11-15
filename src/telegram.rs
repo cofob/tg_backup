@@ -352,12 +352,13 @@ pub async fn sync(root: &Path, mut options: SyncOptions) -> Result<()> {
         state
     };
     {
-        for row in archive.peers()? {
+        let mut peers = vec![];
+        for row in archive.peers_unordered()? {
             let raw = row.raw;
             let value: Value = serde_json::from_str(&raw)?;
             let root = if value["_"] == "user" { "User" } else { "Chat" };
             let bytes = schema.encode(root, &value)?;
-            let peer = if root == "User" {
+            peers.push(if root == "User" {
                 grammers_session::types::PeerInfo::from(grammers_tl_types::enums::User::from_bytes(
                     &bytes,
                 )?)
@@ -365,9 +366,9 @@ pub async fn sync(root: &Path, mut options: SyncOptions) -> Result<()> {
                 grammers_session::types::PeerInfo::from(grammers_tl_types::enums::Chat::from_bytes(
                     &bytes,
                 )?)
-            };
-            session.cache_peer(&peer).await?;
+            });
         }
+        session.cache_peers(&peers)?;
     }
     session
         .set_update_state(UpdateState::All(state.clone()))

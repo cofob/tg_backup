@@ -94,6 +94,35 @@ fn get_peer(db: &Connection, id: PeerId) -> Result<Option<PeerInfo>> {
         .map(|s| serde_json::from_str(&s).context("decode session peer"))
         .transpose()?)
 }
+fn put_peer(db: &Connection, mut peer: PeerInfo) -> Result<()> {
+    let previous = get_peer(db, peer.id())?;
+    if let Some(previous) = &previous {
+        peer.extend_info(previous);
+    }
+    if previous.as_ref() == Some(&peer) {
+        return Ok(());
+    }
+    let is_self = matches!(
+        peer,
+        PeerInfo::User {
+            is_self: Some(true),
+            ..
+        }
+    );
+    db.execute("INSERT INTO peers VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET is_self=excluded.is_self,data=excluded.data",params![peer.id().bot_api_dialog_id().context("peer ID")?,is_self,serde_json::to_string(&peer)?])?;
+    Ok(())
+}
+impl SqliteSession {
+    /// Same as `cache_peer` for each peer, but in one transaction.
+    pub fn cache_peers(&self, peers: &[PeerInfo]) -> Result<()> {
+        let s = self.lock()?;
+        let tx = s.0.unchecked_transaction()?;
+        for peer in peers {
+            put_peer(&tx, peer.clone())?;
+        }
+        Ok(tx.commit()?)
+    }
+}
 impl Session for SqliteSession {
     type Error = SessionError;
     fn home_dc_id(&self) -> Result<i32> {
@@ -123,22 +152,8 @@ impl Session for SqliteSession {
         Box::pin(async move { get_peer(&self.lock()?.0, id) })
     }
     fn cache_peer(&self, peer: &PeerInfo) -> BoxFuture<'_, Result<()>> {
-        let mut peer = peer.clone();
-        Box::pin(async move {
-            let s = self.lock()?;
-            if let Some(previous) = get_peer(&s.0, peer.id())? {
-                peer.extend_info(&previous);
-            }
-            let is_self = matches!(
-                peer,
-                PeerInfo::User {
-                    is_self: Some(true),
-                    ..
-                }
-            );
-            s.0.execute("INSERT INTO peers VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET is_self=excluded.is_self,data=excluded.data",params![peer.id().bot_api_dialog_id().context("peer ID")?,is_self,serde_json::to_string(&peer)?])?;
-            Ok(())
-        })
+        let peer = peer.clone();
+        Box::pin(async move { put_peer(&self.lock()?.0, peer) })
     }
     fn updates_state(&self) -> BoxFuture<'_, Result<UpdatesState>> {
         Box::pin(async move { Ok(self.lock()?.1.updates_state.clone()) })
@@ -195,6 +210,23 @@ mod tests {
         })
         .await
         .unwrap();
+        let other = PeerInfo::User {
+            id: 18,
+            auth: Some(PeerAuth::from_hash(5)),
+            bot: Some(true),
+            is_self: None,
+        };
+        s.cache_peers(&[
+            other.clone(),
+            PeerInfo::User {
+                id: 17,
+                auth: None,
+                bot: None,
+                is_self: None,
+            },
+        ])
+        .unwrap();
+        s.cache_peers(std::slice::from_ref(&other)).unwrap();
         s.set_update_state(UpdateState::Channel { id: 25, pts: 20 })
             .await
             .unwrap();
@@ -203,6 +235,7 @@ mod tests {
         assert_eq!(s.home_dc_id().unwrap(), 4);
         assert_eq!(s.dc_option(4).unwrap().unwrap().auth_key, Some([42; 256]));
         assert_eq!(s.peer(PeerId::self_user()).await.unwrap(), Some(peer));
+        assert_eq!(s.peer(other.id()).await.unwrap(), Some(other));
         assert_eq!(
             s.updates_state().await.unwrap().channels,
             vec![ChannelState { id: 25, pts: 20 }]
