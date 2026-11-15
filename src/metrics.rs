@@ -125,7 +125,8 @@ pub async fn serve(root: PathBuf, bind: std::net::SocketAddr, token: Option<Stri
                 Ok(Ok(value)) => *cached.write().unwrap() = value,
                 _ => *cached.write().unwrap() = "tg_backup_snapshot_available 0\n".into(),
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            // Each snapshot scans large tables; a short interval keeps a core busy.
+            tokio::time::sleep(Duration::from_secs(60)).await;
         }
     });
     let result = axum::serve(
