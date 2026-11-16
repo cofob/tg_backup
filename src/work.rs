@@ -283,6 +283,28 @@ impl Archive {
     pub fn status(&self) -> Result<Value> {
         self.operational_status(false)
     }
+    /// Cheap liveness for container health checks: heartbeats only, no table counts.
+    pub fn health(&self, max_age_seconds: i64) -> Result<Value> {
+        let now = Utc::now().timestamp_micros();
+        let age = |t: Option<i64>| t.map(|t| (now - t) / 1_000_000);
+        // Interrupted runs can leave older jobs marked running; only the newest one is live.
+        let sync = age(self
+            .store
+            .all::<JobRow>()?
+            .into_iter()
+            .filter(|r| r.status == "running")
+            .map(|r| r.updated)
+            .max());
+        let worker = self
+            .checkpoint("worker_runtime")?
+            .filter(|r| r["state"] != "offline")
+            .map(|r| age(r["heartbeat"].as_i64()));
+        let healthy = sync.is_none_or(|a| a <= max_age_seconds)
+            && worker.is_none_or(|a| a.is_some_and(|a| a <= max_age_seconds));
+        Ok(
+            json!({"healthy":healthy,"sync_heartbeat_age_seconds":sync,"worker_heartbeat_age_seconds":worker.flatten()}),
+        )
+    }
     pub fn operational_status(&self, details: bool) -> Result<Value> {
         let mut v = if details {
             self.storage_details()?

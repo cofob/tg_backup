@@ -335,3 +335,28 @@ fn real_webp_transcode_keeps_original_and_survives_maintenance() {
     );
     assert!(report["bytes"].as_u64().unwrap() < u64::from(size));
 }
+#[test]
+fn health_uses_newest_running_job_and_live_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Archive::init(dir.path(), &Config::default()).unwrap();
+    assert_eq!(a.health(900).unwrap()["healthy"], true);
+    let now = chrono::Utc::now().timestamp_micros();
+    let db = a.store.sqlite().unwrap();
+    for (id, updated) in [("old", 0), ("live", now)] {
+        db.execute(
+            "INSERT INTO jobs VALUES(?1,'{}','running',0,?2,'{}')",
+            rusqlite::params![id, updated],
+        )
+        .unwrap();
+    }
+    assert_eq!(a.health(900).unwrap()["healthy"], true);
+    a.set_checkpoint("worker_runtime", &json!({"heartbeat":0,"state":"running"}))
+        .unwrap();
+    assert_eq!(a.health(900).unwrap()["healthy"], false);
+    a.set_checkpoint("worker_runtime", &json!({"heartbeat":0,"state":"offline"}))
+        .unwrap();
+    assert_eq!(a.health(900).unwrap()["healthy"], true);
+    db.execute("UPDATE jobs SET updated=0 WHERE id='live'", [])
+        .unwrap();
+    assert_eq!(a.health(900).unwrap()["healthy"], false);
+}

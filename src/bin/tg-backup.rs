@@ -106,6 +106,11 @@ enum Command {
     },
     Status(tg_backup_protocol::StatusOptions),
     Coverage,
+    /// Exit non-zero when the live sync job or worker heartbeat is stale.
+    Health {
+        #[arg(long, default_value_t = 900)]
+        max_age_seconds: i64,
+    },
     Maintenance {
         #[command(subcommand)]
         command: MaintenanceCommand,
@@ -334,6 +339,11 @@ async fn main() -> Result<()> {
         }
         Command::Jobs => print(&Archive::open(&cli.dataset, false)?.list_table("jobs")?)?,
         Command::Coverage => print(&Archive::open(&cli.dataset, false)?.list_table("coverage")?)?,
+        Command::Health { max_age_seconds } => {
+            let value = Archive::open(&cli.dataset, false)?.health(max_age_seconds)?;
+            println!("{value}");
+            anyhow::ensure!(value["healthy"] == true, "stale heartbeat");
+        }
         Command::Status(options) => loop {
             use std::io::IsTerminal;
             let value = Archive::open(&cli.dataset, false)?.operational_status(options.details)?;
