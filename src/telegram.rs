@@ -452,6 +452,7 @@ pub async fn sync(root: &Path, mut options: SyncOptions) -> Result<()> {
     let update_task = tokio::spawn(async move {
         let _cancel_on_failure = update_engine.stop.clone().drop_guard();
         let mut state = state;
+        let mut seen_peers = std::collections::HashMap::new();
         loop {
             let next = tokio::select! {_=update_engine.stop.cancelled()=>break,update=stream.next_raw()=>update};
             let (update, s, peers) = match next {
@@ -508,6 +509,10 @@ pub async fn sync(root: &Path, mut options: SyncOptions) -> Result<()> {
                         grammers_tl_types::enums::Chat::Channel(c.raw.clone()).to_bytes(),
                     ),
                 };
+                let digest = blake3::hash(&bytes);
+                if seen_peers.insert(peer.id(), digest) == Some(digest) {
+                    continue;
+                }
                 update_engine.capture(root, &bytes, "update_peer", None, None, None)?;
             }
             let bytes = update.to_bytes();
